@@ -24,10 +24,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from actions import MouseActions
 from camera import Camera
+from click_lock import ClickLock
 from config_loader import load_config
 from filters import Cooldown, DeadZone, EMAFilter, JumpGuard
 from gestures_click import PinchClickDetector
-from overlay import draw_hand, draw_hud
+from overlay import draw_hand, draw_hud, draw_lock_indicator, draw_motion_area
 from pointer import PointerMapper
 from tracker import HandTracker
 
@@ -69,6 +70,7 @@ def run(mode: str) -> None:
     pointer = PointerMapper(
         mirror=disp_cfg["mirror"],
         require_index_extended=ptr_cfg["require_index_extended"],
+        motion_area=ptr_cfg.get("motion_area", {}),
     )
     ema = EMAFilter(alpha=ptr_cfg["ema_alpha"])
     dead_zone = DeadZone(threshold_px=ptr_cfg["dead_zone_px"])
@@ -81,6 +83,14 @@ def run(mode: str) -> None:
         stable_frames=clk_cfg["stable_frames"],
     )
     cooldown = Cooldown(cooldown_ms=clk_cfg["cooldown_ms"])
+    lock_cfg = cfg.get("click_lock", {})
+    click_lock = ClickLock(
+        stillness_threshold=lock_cfg.get("stillness_threshold", 0.005),
+        stillness_frames=lock_cfg.get("stillness_frames", 10),
+        shake_buffer=lock_cfg.get("shake_buffer", 5),
+        shake_min_changes=lock_cfg.get("shake_min_changes", 3),
+    ) if lock_cfg.get("enabled", False) else None
+    frozen_pos = None
     mouse = MouseActions()
     tick_fps = fps_counter()
 
@@ -99,6 +109,8 @@ def run(mode: str) -> None:
             hand = tracker.process(frame, ts)
             hud = [f"FPS: {tick_fps():.1f}", f"Mode: {mode}"]
 
+            draw_motion_area(frame, ptr_cfg.get("motion_area", {}), disp_cfg["mirror"])
+
             if hand:
                 draw_hand(frame, hand, disp_cfg)
                 hud.append(f"Hand: {hand['handedness']}")
@@ -110,14 +122,29 @@ def run(mode: str) -> None:
                         sx, sy = ema.update(*raw)
                         sx, sy, moved = dead_zone.apply(sx, sy)
 
-                        if jump_guard.accept(sx, sy) and moved:
-                            mouse.move(sx, sy)
+                        if click_lock is not None:
+                            lock_event = click_lock.update(hand["landmarks"])
+                            if lock_event == "lock":
+                                frozen_pos = (sx, sy)
+                            elif lock_event == "unlock":
+                                frozen_pos = None
+                                jump_guard.reset()
+
+                        if click_lock is not None and click_lock.is_locked() and frozen_pos is not None:
+                            sx, sy = frozen_pos
+                            moved = False
+                        else:
+                            if jump_guard.accept(sx, sy) and moved:
+                                mouse.move(sx, sy)
 
                         hud.append(f"Cursor: ({int(sx)}, {int(sy)})")
+                        hud.append(f"Lock: {'ON' if click_lock and click_lock.is_locked() else 'OFF'}")
                     else:
                         hud.append("Pointer: index not extended")
                         jump_guard.reset()
                         ema.reset()
+                        if click_lock:
+                            click_lock.reset()
 
                     if mode == "full":
                         d = pinch.last_distance
@@ -133,12 +160,17 @@ def run(mode: str) -> None:
                                 hud.append("CLICK!")
                         else:
                             hud.append(f"Cooldown: {cooldown.remaining_ms:.0f}ms")
-                            pinch.update(hand["landmarks"])  # keep state in sync
+                            pinch.update(hand["landmarks"])
             else:
                 hud.append("Hand: not detected")
                 ema.reset()
                 jump_guard.reset()
                 pinch.reset()
+                if click_lock:
+                    click_lock.reset()
+                frozen_pos = None
+
+            draw_lock_indicator(frame, click_lock is not None and click_lock.is_locked())
 
             hud.append(f"Mouse control: {'ON' if mouse.enabled else 'OFF'}")
             hud.append(f"Clicks: {clicks}")

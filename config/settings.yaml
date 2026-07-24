@@ -15,6 +15,19 @@ pointer:
   dead_zone_px: 5         # ignore tiny movements
   max_jump_ratio: 0.10    # drop frame if cursor jumps > 10% of screen
   require_index_extended: true
+  motion_area:
+    enabled: true
+    x_min: 0.2
+    x_max: 0.8
+    y_min: 0.2
+    y_max: 0.8
+
+click_lock:
+  enabled: true
+  stillness_threshold: 0.005
+  stillness_frames: 10
+  shake_buffer: 5
+  shake_min_changes: 3
 
 click:
   pinch_on: 0.06          # normalized distance — fingers "touching"

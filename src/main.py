@@ -22,15 +22,15 @@ import cv2
 # Allow imports when running as script
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from actions import MouseActions
-from camera import Camera
-from click_lock import ClickLock
-from config_loader import load_config
-from filters import Cooldown, DeadZone, EMAFilter, JumpGuard
-from gestures_click import PinchClickDetector
-from overlay import draw_hand, draw_hud, draw_lock_indicator, draw_motion_area
-from pointer import PointerMapper
-from tracker import HandTracker
+from actions import MouseActions  # noqa: E402
+from camera import Camera  # noqa: E402
+from click_lock import ClickLock  # noqa: E402
+from config_loader import load_config  # noqa: E402
+from filters import Cooldown, DeadZone, JumpGuard, make_pointer_filter  # noqa: E402
+from gestures_click import PinchClickDetector  # noqa: E402
+from overlay import draw_hand, draw_hud, draw_lock_indicator, draw_motion_area  # noqa: E402
+from pointer import PointerMapper  # noqa: E402
+from tracker import HandTracker  # noqa: E402
 
 
 def fps_counter():
@@ -53,26 +53,36 @@ def run(mode: str) -> None:
     ptr_cfg = cfg["pointer"]
     clk_cfg = cfg["click"]
     disp_cfg = cfg["display"]
+    gesture_cfg = cfg.get("gestures", {})
 
     camera = Camera(
         index=cam_cfg["index"],
         width=cam_cfg["width"],
         height=cam_cfg["height"],
         buffer_size=cam_cfg["buffer_size"],
+        fps=cam_cfg.get("fps", 30),
+        backend=cam_cfg.get("backend", "auto"),
+        auto_focus=cam_cfg.get("auto_focus", False),
+        auto_exposure=cam_cfg.get("auto_exposure", False),
     )
     tracker = HandTracker(
         max_num_hands=trk_cfg["max_num_hands"],
         min_detection_confidence=trk_cfg["min_detection_confidence"],
         min_hand_presence_confidence=trk_cfg["min_hand_presence_confidence"],
         min_tracking_confidence=trk_cfg["min_tracking_confidence"],
+        use_gpu=trk_cfg.get("use_gpu", True),
+        prefer_hand=trk_cfg.get("prefer_hand", ""),
     )
 
     pointer = PointerMapper(
         mirror=disp_cfg["mirror"],
         require_index_extended=ptr_cfg["require_index_extended"],
         motion_area=ptr_cfg.get("motion_area", {}),
+        gate_release_frames=gesture_cfg.get("debounce_frames", 3),
     )
-    ema = EMAFilter(alpha=ptr_cfg["ema_alpha"])
+    # Adaptive 1€ smoother (config `pointer/filter`) — kills rest jitter,
+    # stays snappy in motion. Same update()/reset() interface as EMA.
+    smoother = make_pointer_filter(ptr_cfg)
     dead_zone = DeadZone(threshold_px=ptr_cfg["dead_zone_px"])
     jump_guard = JumpGuard(
         ptr_cfg["max_jump_ratio"], pointer.screen_w, pointer.screen_h,
@@ -119,7 +129,7 @@ def run(mode: str) -> None:
                     raw = pointer.landmarks_to_screen(hand["landmarks"])
 
                     if raw:
-                        sx, sy = ema.update(*raw)
+                        sx, sy = smoother.update(*raw)
                         sx, sy, moved = dead_zone.apply(sx, sy)
 
                         if click_lock is not None:
@@ -142,28 +152,31 @@ def run(mode: str) -> None:
                     else:
                         hud.append("Pointer: index not extended")
                         jump_guard.reset()
-                        ema.reset()
+                        smoother.reset()
+                        pointer.reset()
                         if click_lock:
                             click_lock.reset()
 
                     if mode == "full":
-                        d = pinch.last_distance
-                        if d is not None:
-                            hud.append(f"Pinch dist: {d:.3f}")
+                        r = pinch.last_ratio
+                        if r is not None:
+                            hud.append(f"Pinch ratio: {r:.2f}")
 
-                        if cooldown.ready():
-                            action = pinch.update(hand["landmarks"])
-                            if action == "click":
+                        # State always advances (re-arm tracked through the
+                        # cooldown); the cooldown gates *firing*, not sensing.
+                        action = pinch.update(hand["landmarks"])
+                        if action == "click":
+                            if cooldown.ready():
                                 mouse.click()
                                 cooldown.fire()
                                 clicks += 1
                                 hud.append("CLICK!")
-                        else:
-                            hud.append(f"Cooldown: {cooldown.remaining_ms:.0f}ms")
-                            pinch.update(hand["landmarks"])
+                            else:
+                                hud.append(f"Cooldown: {cooldown.remaining_ms:.0f}ms")
             else:
                 hud.append("Hand: not detected")
-                ema.reset()
+                smoother.reset()
+                pointer.reset()
                 jump_guard.reset()
                 pinch.reset()
                 if click_lock:

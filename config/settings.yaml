@@ -1,18 +1,32 @@
 camera:
   index: 0
-  width: 640
-  height: 480
+  width: 1280             # higher resolution = sharper, more precise landmarks
+  height: 720
+  fps: 30
   buffer_size: 1          # keep at 1 — avoids showing stale frames (lag)
+  backend: auto           # auto | dshow | v4l2 | avfoundation | any
+  auto_focus: false       # lock focus — AF hunting causes landmark wobble
+  auto_exposure: false    # lock exposure — stable brightness = stable tracking
 
 tracker:
   max_num_hands: 1
   min_detection_confidence: 0.7
   min_hand_presence_confidence: 0.7
   min_tracking_confidence: 0.7
+  use_gpu: true           # GPU delegate when available; falls back to CPU
+  prefer_hand: ""         # "Left" | "Right" | "" (first detected hand)
+
+gestures:
+  debounce_frames: 3      # a gesture must persist N frames before it counts
 
 pointer:
-  ema_alpha: 0.35         # higher = snappier, lower = smoother
-  dead_zone_px: 5         # ignore tiny movements
+  filter: one_euro        # one_euro | ema  — one_euro is adaptive (best)
+  ema_alpha: 0.35         # used only when filter: ema
+  one_euro:               # 1€ filter (Casiez 2012): kills jitter at rest,
+    min_cutoff: 1.2       #   stays snappy in motion (Hz)
+    beta: 0.008           #   speed coefficient — raise to cut lag further
+    d_cutoff: 1.0         #   derivative smoothing (Hz)
+  dead_zone_px: 1         # tiny — the 1€ filter removes jitter, not the dead zone
   max_jump_ratio: 0.10    # drop frame if cursor jumps > 10% of screen
   require_index_extended: true
   motion_area:
@@ -30,9 +44,9 @@ click_lock:
   shake_min_changes: 3
 
 click:
-  pinch_on: 0.06          # normalized distance — fingers "touching"
-  pinch_off: 0.06         # must open wider than this to re-arm (hysteresis)
-  stable_frames: 4        # pinch must hold this many frames before click
+  pinch_on: 0.25          # normalized pinch RATIO (tip distance / hand size)
+  pinch_off: 0.40         # must open wider than this to re-arm (real hysteresis)
+  stable_frames: 3        # pinch must hold this many frames before click
   cooldown_ms: 400        # block repeat clicks
 
 display:

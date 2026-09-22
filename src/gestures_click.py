@@ -1,61 +1,88 @@
-"""Pinch click — thumb tip (4) + index tip (8) distance with hysteresis."""
+"""Pinch click — thumb tip (4) + index tip (8), scale-invariant ratio.
 
-import math
+Metric: pinch_ratio = dist(thumb_tip, index_tip) / hand_size (landmarks.py),
+so thresholds hold whether the hand fills the frame or sits a metre back.
+Hysteresis: pinch_on < pinch_off prevents flutter at the threshold.
+"""
 
-from tracker import HandTracker
+import landmarks as L
 
 
 class PinchClickDetector:
     """
     States:
-      open   -> pinch detected -> holding -> click fired -> cooldown (open re-arm)
-    Hysteresis: pinch_on < pinch_off prevents flutter at the threshold.
+      open -> pinching (ratio < pinch_on, counting stable frames)
+        -> click fired -> FIRED until ratio > pinch_off re-arms to open.
     """
 
     OPEN = "open"
     PINCHING = "pinching"
     FIRED = "fired"
 
+    # Legacy absolute-distance thresholds (< 0.15, pre-ratio code) are scaled
+    # to ratio units so old configs keep working instead of never firing.
+    _LEGACY_SCALE = 5.0
+
     def __init__(
         self,
-        pinch_on: float = 0.04,
-        pinch_off: float = 0.06,
+        pinch_on: float = 0.25,
+        pinch_off: float = 0.40,
         stable_frames: int = 3,
     ) -> None:
+        if pinch_on < 0.15 and pinch_off < 0.15:
+            pinch_on *= self._LEGACY_SCALE
+            pinch_off *= self._LEGACY_SCALE
+        if pinch_off <= pinch_on:
+            pinch_off = pinch_on + 0.05
         self.pinch_on = pinch_on
         self.pinch_off = pinch_off
-        self.stable_frames = stable_frames
+        self.stable_frames = max(1, stable_frames)
         self.state = self.OPEN
         self._stable_count = 0
-        self.last_distance = None
+        self.last_distance = None  # raw tip distance (HUD/debug, normalized units)
+        self.last_ratio = None  # scale-invariant pinch metric
 
     def _distance(self, landmarks) -> float:
-        thumb = landmarks[HandTracker.THUMB_TIP]
-        index = landmarks[HandTracker.INDEX_TIP]
-        return math.dist(thumb[:2], index[:2])
+        return L.tip_distance(landmarks)
+
+    def _ratio(self, landmarks) -> float:
+        return L.pinch_ratio(landmarks)
 
     def update(self, landmarks) -> str | None:
         """
         Returns 'click' once when pinch confirmed, else None.
         """
-        d = self._distance(landmarks)
-        self.last_distance = d
+        self.last_distance = self._distance(landmarks)
+        r = self._ratio(landmarks)
+        self.last_ratio = r
 
         if self.state == self.OPEN:
-            if d < self.pinch_on:
+            if r < self.pinch_on:
+                self.state = self.PINCHING
+                self._stable_count = 1
+                if self._stable_count >= self.stable_frames:
+                    self.state = self.FIRED
+                    self._stable_count = 0
+                    return "click"
+            # else: stay OPEN, count stays 0
+
+        elif self.state == self.PINCHING:
+            if r < self.pinch_on:
                 self._stable_count += 1
                 if self._stable_count >= self.stable_frames:
                     self.state = self.FIRED
                     self._stable_count = 0
                     return "click"
-            else:
-                self._stable_count = 0
-
-        elif self.state == self.FIRED:
-            # Re-arm only after fingers open past pinch_off
-            if d > self.pinch_off:
+            elif r > self.pinch_off:
+                # released before confirming — back to open
                 self.state = self.OPEN
                 self._stable_count = 0
+            # else: in the hysteresis band — hold count, wait
+
+        elif self.state == self.FIRED and r > self.pinch_off:
+            # Re-arm only after fingers open past pinch_off
+            self.state = self.OPEN
+            self._stable_count = 0
 
         return None
 

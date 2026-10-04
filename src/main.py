@@ -1,14 +1,16 @@
 """
-Live camera gesture control — Phase 1 & 2 prototype.
+Live camera gesture control — Phase 1 & 2 prototype + game overlay.
 
 Run from project root:
   python src/main.py                  # full: pointer + pinch click
   python src/main.py --mode tracker   # camera + landmarks only
   python src/main.py --mode pointer   # move mouse, no click
+  python src/main.py --mode game      # PBO hand controller (see game_mode)
 
-Keys:
+Keys (pointer/full):
   q / Esc  — quit
   p        — toggle mouse control on/off (safe testing)
+Keys (game): see game_mode.run_game docstring (q/k/h/c).
 """
 
 import argparse
@@ -26,7 +28,13 @@ from actions import MouseActions  # noqa: E402
 from camera import Camera  # noqa: E402
 from click_lock import ClickLock  # noqa: E402
 from config_loader import load_config  # noqa: E402
-from filters import Cooldown, DeadZone, JumpGuard, make_pointer_filter  # noqa: E402
+from filters import (  # noqa: E402
+    Cooldown,
+    DeadZone,
+    JumpGuard,
+    MotionPredictor,
+    make_pointer_filter,
+)
 from gestures_click import PinchClickDetector  # noqa: E402
 from overlay import draw_hand, draw_hud, draw_lock_indicator, draw_motion_area  # noqa: E402
 from pointer import PointerMapper  # noqa: E402
@@ -62,8 +70,13 @@ def run(mode: str) -> None:
         buffer_size=cam_cfg["buffer_size"],
         fps=cam_cfg.get("fps", 30),
         backend=cam_cfg.get("backend", "auto"),
-        auto_focus=cam_cfg.get("auto_focus", False),
-        auto_exposure=cam_cfg.get("auto_exposure", False),
+        auto_focus=cam_cfg.get("auto_focus", True),
+        auto_exposure=cam_cfg.get("auto_exposure", True),
+        exposure=cam_cfg.get("exposure"),
+        gain=cam_cfg.get("gain"),
+        brightness=cam_cfg.get("brightness"),
+        focus=cam_cfg.get("focus"),
+        auto_white_balance=cam_cfg.get("auto_white_balance"),
     )
     tracker = HandTracker(
         max_num_hands=trk_cfg["max_num_hands"],
@@ -78,27 +91,41 @@ def run(mode: str) -> None:
         mirror=disp_cfg["mirror"],
         require_index_extended=ptr_cfg["require_index_extended"],
         motion_area=ptr_cfg.get("motion_area", {}),
-        gate_release_frames=gesture_cfg.get("debounce_frames", 3),
+        gate_release_frames=gesture_cfg.get("debounce_frames", 2),
+        coast_frames=ptr_cfg.get("coast_frames", 5),
     )
     # Adaptive 1€ smoother (config `pointer/filter`) — kills rest jitter,
-    # stays snappy in motion. Same update()/reset() interface as EMA.
+    # stays snappy in motion. Fed the real camera timestamp so the cutoff
+    # tracks the true frame rate; followed by a constant-velocity predictor
+    # hiding ~1 frame of pipeline lag.
     smoother = make_pointer_filter(ptr_cfg)
-    dead_zone = DeadZone(threshold_px=ptr_cfg["dead_zone_px"])
+    predictor = MotionPredictor(
+        lead_s=ptr_cfg.get("predict_lead_ms", 24) / 1000.0,
+        max_lead_px=ptr_cfg.get("predict_max_px", 48),
+    )
+    dead_zone = DeadZone(threshold_px=ptr_cfg.get("dead_zone_px", 0))
     jump_guard = JumpGuard(
-        ptr_cfg["max_jump_ratio"], pointer.screen_w, pointer.screen_h,
+        ptr_cfg.get("max_jump_ratio", 0.25),
+        pointer.screen_w, pointer.screen_h,
+        max_rejects=ptr_cfg.get("max_rejects", 3),
     )
     pinch = PinchClickDetector(
         pinch_on=clk_cfg["pinch_on"],
         pinch_off=clk_cfg["pinch_off"],
-        stable_frames=clk_cfg["stable_frames"],
+        stable_frames=clk_cfg.get("stable_frames", 2),
+        smooth_alpha_up=clk_cfg.get("smooth_alpha_up", 0.85),
+        smooth_alpha_down=clk_cfg.get("smooth_alpha_down", 0.5),
     )
-    cooldown = Cooldown(cooldown_ms=clk_cfg["cooldown_ms"])
+    cooldown = Cooldown(cooldown_ms=clk_cfg.get("cooldown_ms", 250))
     lock_cfg = cfg.get("click_lock", {})
     click_lock = ClickLock(
-        stillness_threshold=lock_cfg.get("stillness_threshold", 0.005),
-        stillness_frames=lock_cfg.get("stillness_frames", 10),
-        shake_buffer=lock_cfg.get("shake_buffer", 5),
+        stillness_threshold=lock_cfg.get("stillness_threshold", 0.003),
+        stillness_frames=lock_cfg.get("stillness_frames", 32),
+        shake_buffer=lock_cfg.get("shake_buffer", 8),
         shake_min_changes=lock_cfg.get("shake_min_changes", 3),
+        unlock_threshold=lock_cfg.get("unlock_threshold", 0.012),
+        unlock_confirm_frames=lock_cfg.get("unlock_confirm_frames", 2),
+        relock_cooldown_frames=lock_cfg.get("relock_cooldown_frames", 20),
     ) if lock_cfg.get("enabled", False) else None
     frozen_pos = None
     mouse = MouseActions()
@@ -129,11 +156,24 @@ def run(mode: str) -> None:
                     raw = pointer.landmarks_to_screen(hand["landmarks"])
 
                     if raw:
-                        sx, sy = smoother.update(*raw)
+                        # Real camera timestamp -> correct dt inside 1€;
+                        # predictor hides ~1 frame of tracking lag.
+                        sx, sy = smoother.update(*raw, t=ts)
+                        sx, sy = predictor.update(sx, sy, t=ts)
                         sx, sy, moved = dead_zone.apply(sx, sy)
 
                         if click_lock is not None:
-                            lock_event = click_lock.update(hand["landmarks"])
+                            # Don't accumulate stillness mid-pinch: aiming a
+                            # click holds the hand still, which used to freeze
+                            # the cursor right before the click landed.
+                            pinching = (
+                                mode == "full"
+                                and pinch.state == PinchClickDetector.PINCHING
+                            )
+                            if not pinching:
+                                lock_event = click_lock.update(hand["landmarks"])
+                            else:
+                                lock_event = None
                             if lock_event == "lock":
                                 frozen_pos = (sx, sy)
                             elif lock_event == "unlock":
@@ -153,6 +193,7 @@ def run(mode: str) -> None:
                         hud.append("Pointer: index not extended")
                         jump_guard.reset()
                         smoother.reset()
+                        predictor.reset()
                         pointer.reset()
                         if click_lock:
                             click_lock.reset()
@@ -176,6 +217,7 @@ def run(mode: str) -> None:
             else:
                 hud.append("Hand: not detected")
                 smoother.reset()
+                predictor.reset()
                 pointer.reset()
                 jump_guard.reset()
                 pinch.reset()
@@ -208,12 +250,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mode",
-        choices=["tracker", "pointer", "full"],
+        choices=["tracker", "pointer", "full", "game"],
         default="full",
-        help="tracker=landmarks only | pointer=move mouse | full=move+click",
+        help="tracker=landmarks only | pointer=move mouse | "
+        "full=move+click | game=PBO hand controller overlay",
     )
     args = parser.parse_args()
-    run(args.mode)
+    if args.mode == "game":
+        from game_mode import run_game
+
+        run_game()
+    else:
+        run(args.mode)
 
 
 if __name__ == "__main__":

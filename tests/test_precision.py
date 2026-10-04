@@ -80,7 +80,8 @@ def test_pinch_ratio_touching_vs_open():
 
 
 def test_pinch_flutter_fires_once():
-    det = PinchClickDetector(pinch_on=0.25, pinch_off=0.40, stable_frames=3)
+    det = PinchClickDetector(pinch_on=0.25, pinch_off=0.40, stable_frames=3,
+                             smooth_alpha_up=1.0, smooth_alpha_down=1.0)
     # hold a solid pinch -> exactly one click
     fires = [det.update(make_hand(thumb_gap=0.05)) for _ in range(6)]
     assert fires.count("click") == 1
@@ -92,7 +93,8 @@ def test_pinch_flutter_fires_once():
 
 
 def test_pinch_needs_stable_frames():
-    det = PinchClickDetector(pinch_on=0.25, pinch_off=0.40, stable_frames=3)
+    det = PinchClickDetector(pinch_on=0.25, pinch_off=0.40, stable_frames=3,
+                             smooth_alpha_up=1.0, smooth_alpha_down=1.0)
     assert det.update(make_hand(thumb_gap=0.05)) is None
     assert det.update(make_hand(thumb_gap=0.05)) is None
     assert det.update(make_hand(thumb_gap=0.9)) is None  # blip resets count
@@ -177,6 +179,7 @@ def test_pointer_gate_rides_out_single_bent_frame():
         motion_area={"enabled": False},
         screen_size=(1000, 1000),
         gate_release_frames=3,
+        coast_frames=0,  # isolate the gate: no coast hold in this test
     )
     open_hand = make_hand(index_curl="open")
     bent_hand = make_hand(index_curl="bent")
@@ -217,3 +220,171 @@ def test_resolve_backend_names():
     assert resolve_backend("avfoundation") == _BACKENDS["avfoundation"]
     assert resolve_backend("bogus") == _BACKENDS["any"]
     assert resolve_backend("auto") in tuple(_BACKENDS.values())
+
+
+# --- pointer coast: blink-length gate loss holds position ----------------------
+
+
+def test_pointer_coast_holds_through_brief_fold():
+    from pointer import PointerMapper
+
+    pm = PointerMapper(
+        mirror=False,
+        motion_area={"enabled": False},
+        screen_size=(1000, 1000),
+        gate_release_frames=2,
+        coast_frames=5,
+    )
+    open_hand = make_hand(index_curl="open")
+    bent_hand = make_hand(index_curl="bent")
+    first = pm.landmarks_to_screen(open_hand)
+    assert first is not None
+    # gate still open on the 1st folded frame: live (bent) position
+    second = pm.landmarks_to_screen(bent_hand)
+    assert second is not None
+    # gate closed on the 2nd folded frame, but coast holds last live pos
+    held = pm.landmarks_to_screen(bent_hand)
+    assert held == second
+    # ... and reopening resumes live tracking instantly
+    assert pm.landmarks_to_screen(open_hand) is not None
+
+
+# --- predictor: leads motion, never leaps on stop ------------------------------
+
+
+def test_predictor_leads_and_clamps():
+    from filters import MotionPredictor
+
+    p = MotionPredictor(lead_s=0.024, velocity_alpha=1.0, max_lead_px=48.0)
+    t = 1000.0
+    x, y = 100.0, 100.0
+    # steady 1000 px/s diagonal motion at 30 fps
+    for i in range(10):
+        t += 1 / 30.0
+        x, y = x + 1000 / 30.0, y + 1000 / 30.0
+        px, py = p.update(x, y, t=t)
+    # prediction leads along motion, bounded by max_lead_px
+    assert px > x and py > y
+    assert math.dist((px, py), (x, y)) <= 48.0 + 1e-6
+    # sudden stop: next update at same spot predicts (near) no leap
+    px2, py2 = p.update(x, y, t=t + 1 / 30.0)
+    assert math.dist((px2, py2), (x, y)) <= 48.0 + 1e-6
+
+
+# --- asymmetric smoother: slow to engage, fast to release ----------------------
+
+
+def test_asymmetric_smoother_direction_rates():
+    from filters import AsymmetricSmoother
+
+    s = AsymmetricSmoother(alpha_up=0.85, alpha_down=0.5)
+    assert s.update(1.0) == 1.0
+    # falling edge uses alpha_down: one step moves only halfway
+    assert s.update(0.0) == pytest.approx(0.5)
+    # rising edge uses alpha_up: snaps back most of the way
+    assert s.update(1.0) == pytest.approx(0.5 + 0.85 * 0.5)
+
+
+# --- pinch smoothing: borderline jitter still clicks, once -----------------------
+
+
+def test_pinch_smoothing_rides_out_borderline_jitter():
+    from gestures_click import PinchClickDetector
+
+    det = PinchClickDetector(pinch_on=0.25, pinch_off=0.40, stable_frames=2)
+    seq = [
+        make_hand(thumb_gap=0.05),  # solid pinch
+        make_hand(thumb_gap=0.30),  # jitter into the hysteresis band
+        make_hand(thumb_gap=0.05),
+        make_hand(thumb_gap=0.05),
+        make_hand(thumb_gap=0.05),
+        make_hand(thumb_gap=0.05),
+    ]
+    fires = [det.update(h) for h in seq]
+    assert fires.count("click") == 1
+    assert fires.index("click") <= 3  # no extra delay from the noisy frame
+
+
+# --- click lock: deliberate hold locks, any motion unlocks ---------------------
+
+
+def _lock_landmarks(ix, iy, tx=None, ty=None, wx=None, wy=None):
+    """21-landmark stub with index/thumb/wrist placed; rest centered."""
+    lm = [[0.5, 0.5, 0.0] for _ in range(21)]
+    lm[8] = [ix, iy, 0.0]
+    lm[4] = [ix if tx is None else tx, iy if ty is None else ty, 0.0]
+    lm[0] = [ix if wx is None else wx, iy if wy is None else wy, 0.0]
+    return lm
+
+
+def _new_lock(**over):
+    from click_lock import ClickLock
+
+    kw = dict(
+        stillness_threshold=0.003,
+        stillness_frames=32,
+        unlock_threshold=0.012,
+        unlock_confirm_frames=2,
+        relock_cooldown_frames=20,
+    )
+    kw.update(over)
+    return ClickLock(**kw)
+
+
+def test_click_lock_needs_sustained_stillness_then_easy_unlock():
+    lock = _new_lock()
+    # brief aiming pause (15 frames) must NOT lock
+    events = [lock.update(_lock_landmarks(0.5, 0.5)) for _ in range(15)]
+    assert events == [None] * 15
+    assert not lock.is_locked()
+    # sustained deliberate hold locks (~1.1 s)
+    events = [lock.update(_lock_landmarks(0.5, 0.5)) for _ in range(30)]
+    assert "lock" in events
+    assert lock.is_locked()
+    # confirmed deliberate motion unlocks (2 frames running)
+    assert lock.update(_lock_landmarks(0.5 + 0.02, 0.5)) is None  # 1st vote
+    assert lock.update(_lock_landmarks(0.5 + 0.02, 0.5)) == "unlock"  # 2nd
+    assert not lock.is_locked()
+    # ... and it must not snap locked again right away
+    for _ in range(10):
+        assert lock.update(_lock_landmarks(0.52, 0.5)) is None
+    assert not lock.is_locked()
+
+
+def test_click_lock_ignores_moving_thumb_while_aiming():
+    # shaping a pinch (thumb travelling, index steady) must NOT lock
+    lock = _new_lock()
+    events = []
+    for i in range(45):
+        t = 0.5 + (0.01 if i % 2 == 0 else -0.01)
+        events.append(lock.update(_lock_landmarks(0.5, 0.5, tx=t, ty=0.5)))
+    assert "lock" not in events
+    assert not lock.is_locked()
+
+
+def test_click_lock_single_spike_does_not_break_lock():
+    lock = _new_lock()
+    for _ in range(45):
+        lock.update(_lock_landmarks(0.5, 0.5))
+    assert lock.is_locked()
+    # lone jitter spike, then back on station — lock holds
+    assert lock.update(_lock_landmarks(0.5 + 0.02, 0.5)) is None
+    assert lock.is_locked()
+    assert lock.update(_lock_landmarks(0.5, 0.5)) is None
+    assert lock.is_locked()
+
+
+def test_click_lock_shake_unlock_still_works():
+    lock = _new_lock()
+    for _ in range(45):
+        lock.update(_lock_landmarks(0.5, 0.5))
+    assert lock.is_locked()
+    # small lateral shake, inside the vote radius — shake path unlocks
+    result = None
+    for i in range(12):
+        x = 0.5 + (0.005 if i % 2 == 0 else -0.005)
+        result = lock.update(_lock_landmarks(x, 0.5))
+        if result == "unlock":
+            break
+    assert result == "unlock"
+    assert not lock.is_locked()

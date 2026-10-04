@@ -55,8 +55,14 @@ class Camera:
         buffer_size: int = 1,
         fps: int = 30,
         backend: str = "auto",
-        auto_focus: bool = False,
-        auto_exposure: bool = False,
+        auto_focus: bool = True,
+        auto_exposure: bool = True,
+        exposure: float | None = None,
+        gain: float | None = None,
+        brightness: float | None = None,
+        focus: float | None = None,
+        auto_white_balance: bool | None = None,
+        warmup_frames: int | None = None,
     ) -> None:
         flag = resolve_backend(backend)
         self.cap = cv2.VideoCapture(index, flag)
@@ -73,25 +79,78 @@ class Camera:
         self.cap.set(cv2.CAP_PROP_FPS, fps)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, buffer_size)
 
-        if not auto_focus:
-            # Lock focus: AF hunting breathes the image and wobbles landmarks.
-            self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
-        if not auto_exposure:
-            # Manual exposure (0.25 = manual mode on most UVC drivers):
-            # stable brightness = stable detection thresholds.
-            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+        is_dshow = flag == cv2.CAP_DSHOW
+
+        # --- Exposure: default to AUTO (matches Camera app / Meet / Zoom).
+        # Forcing manual exposure without an explicit EXPOSURE value leaves
+        # most UVC drivers at minimum exposure -> near-black image
+        # (measured mean pixel 117 -> 2.6 on this machine). So manual mode
+        # is only engaged when the user also supplies `exposure` (and
+        # optionally `gain`).
+        if auto_exposure:
+            # Re-enable auto: 0.75 = auto on DSHOW/UVC, 1.0 = auto elsewhere.
+            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75 if is_dshow else 1.0)
+            if exposure is not None:
+                print("[camera] note: `exposure` ignored while auto_exposure=true")
+            if gain is not None:
+                self.cap.set(cv2.CAP_PROP_GAIN, gain)
+        else:
+            if exposure is None and gain is None:
+                # Fail-safe: stay in auto instead of going black.
+                print(
+                    "[camera] WARNING: auto_exposure=false but no "
+                    "`exposure`/`gain` given — staying in AUTO to avoid "
+                    "a black image. Set camera.exposure (e.g. -5) to lock."
+                )
+                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75 if is_dshow else 1.0)
+            else:
+                # Manual exposure (0.25 = manual on DSHOW/UVC, 0 = manual
+                # on some V4L2 drivers) + explicit value = stable brightness.
+                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25 if is_dshow else 0.0)
+                if exposure is not None:
+                    self.cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
+                if gain is not None:
+                    self.cap.set(cv2.CAP_PROP_GAIN, gain)
+
+        # --- Focus: default to AUTO (matches other apps). Lock only on request.
+        if auto_focus:
+            try:
+                self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+            except Exception:
+                pass
+            if focus is not None:
+                print("[camera] note: `focus` ignored while auto_focus=true")
+        else:
+            try:
+                self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+            except Exception:
+                pass
+            if focus is not None:
+                self.cap.set(cv2.CAP_PROP_FOCUS, focus)
+
+        if brightness is not None:
+            self.cap.set(cv2.CAP_PROP_BRIGHTNESS, brightness)
+        if auto_white_balance is not None:
+            try:
+                self.cap.set(cv2.CAP_PROP_AUTO_WB, 1 if auto_white_balance else 0)
+            except Exception:
+                pass
 
         actual_w = _prop_int(self.cap, cv2.CAP_PROP_FRAME_WIDTH)
         actual_h = _prop_int(self.cap, cv2.CAP_PROP_FRAME_HEIGHT)
         actual_fps = _prop(self.cap, cv2.CAP_PROP_FPS)
 
-        # Warmup: discard first frames while AE/AWB settles.
-        for _ in range(5):
+        # Warmup: let AE/AWB settle when auto (matches Camera app behavior).
+        # 5 frames is not enough for auto-exposure to converge from dark.
+        if warmup_frames is None:
+            warmup_frames = 30 if (auto_exposure or auto_focus) else 5
+        for _ in range(max(1, warmup_frames)):
             self.cap.read()
 
         print(
             f"[camera] opened index={index} backend={backend} "
-            f"resolution={actual_w}x{actual_h} fps={actual_fps:.0f}"
+            f"resolution={actual_w}x{actual_h} fps={actual_fps:.0f} "
+            f"auto_exposure={auto_exposure} auto_focus={auto_focus}"
         )
 
     def read(self):

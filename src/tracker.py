@@ -55,11 +55,11 @@ class HandTracker:
         self._landmarker = vision.HandLandmarker.create_from_options(options)
         self._start_ms = _to_ms(time.perf_counter(), 0)
 
-    def process(self, frame_bgr, timestamp_s: float | None = None):
+    def process_all(self, frame_bgr, timestamp_s: float | None = None):
         """
-        Returns dict with landmarks (21 x [x,y,z] normalized 0-1) or None.
-        Uses VIDEO mode — timestamp must increase each call.
-        With several hands visible, the preferred (or largest) wins.
+        Returns list of dicts [{landmarks, handedness}] (empty if no hands).
+        Hardware-facing (MediaPipe); game_mode uses this for the two-hand
+        1+1 toggle, main.py pointer mode keeps using process().
         """
         if timestamp_s is None:
             timestamp_ms = _to_ms(time.perf_counter(), self._start_ms)
@@ -74,7 +74,7 @@ class HandTracker:
         result = self._landmarker.detect_for_video(mp_image, timestamp_ms)
 
         if not result.hand_landmarks:
-            return None
+            return []
 
         hands = [[[lm.x, lm.y, lm.z] for lm in h] for h in result.hand_landmarks]
         names = [
@@ -82,12 +82,26 @@ class HandTracker:
             for cats in (result.handedness or [])
         ]
         names += ["Unknown"] * (len(hands) - len(names))
+        return [
+            {"landmarks": h, "handedness": n}
+            for h, n in zip(hands, names)
+        ]
+
+    def process(self, frame_bgr, timestamp_s: float | None = None):
+        """
+        Returns dict with landmarks (21 x [x,y,z] normalized 0-1) or None.
+        Uses VIDEO mode — timestamp must increase each call.
+        With several hands visible, the preferred (or largest) wins.
+        """
+        all_hands = self.process_all(frame_bgr, timestamp_s)
+        if not all_hands:
+            return None
+
+        hands = [h["landmarks"] for h in all_hands]
+        names = [h["handedness"] for h in all_hands]
         idx = L.choose_hand_index(hands, names, self.prefer_hand)
 
-        return {
-            "landmarks": hands[idx],
-            "handedness": names[idx],
-        }
+        return all_hands[idx]
 
     def close(self) -> None:
         self._landmarker.close()

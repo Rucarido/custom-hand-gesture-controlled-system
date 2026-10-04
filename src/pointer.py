@@ -40,6 +40,7 @@ class PointerMapper:
         screen_size: tuple[int, int] | None = None,
         gate_release_frames: int = 3,
         tip_blend: float = 0.7,
+        coast_frames: int = 5,
     ) -> None:
         self.mirror = mirror
         self.require_index_extended = require_index_extended
@@ -49,7 +50,10 @@ class PointerMapper:
             self.screen_w, self.screen_h = screen_size
         self.gate_release_frames = max(1, gate_release_frames)
         self.tip_blend = min(1.0, max(0.0, tip_blend))
+        self.coast_frames = max(0, coast_frames)
         self._folded_count = 0
+        self._last_valid = None
+        self._coast_left = 0
 
         if motion_area and motion_area.get("enabled", True):
             self._ma_x_min = motion_area["x_min"]
@@ -90,6 +94,12 @@ class PointerMapper:
 
     def landmarks_to_screen(self, landmarks) -> tuple[float, float] | None:
         if not self._gate_open(landmarks):
+            # Coast: a blink-length gate loss (pinch dip, motion blur) holds
+            # the last position so the smoother/predictor keep gliding
+            # instead of resetting and teleporting on reopen.
+            if self._last_valid is not None and self._coast_left > 0:
+                self._coast_left -= 1
+                return self._last_valid
             return None
 
         x, y, _ = self._stable_tip(landmarks)
@@ -102,7 +112,11 @@ class PointerMapper:
 
         screen_x = x * self.screen_w
         screen_y = y * self.screen_h
+        self._last_valid = (screen_x, screen_y)
+        self._coast_left = self.coast_frames
         return screen_x, screen_y
 
     def reset(self) -> None:
         self._folded_count = 0
+        self._last_valid = None
+        self._coast_left = 0

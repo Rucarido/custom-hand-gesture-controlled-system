@@ -5,29 +5,42 @@ camera:
   fps: 30
   buffer_size: 1          # keep at 1 — avoids showing stale frames (lag)
   backend: auto           # auto | dshow | v4l2 | avfoundation | any
-  auto_focus: false       # lock focus — AF hunting causes landmark wobble
-  auto_exposure: false    # lock exposure — stable brightness = stable tracking
+  auto_focus: true        # true = match Camera app focus; false = lock (needs `focus`)
+  auto_exposure: true     # true = match Camera app brightness (recommended); false = lock (needs tuning)
+  # Manual lock (only used when auto_* is false). WARNING: on Windows/DSHOW
+  # manual exposure is much darker than auto at the same value — keep
+  # auto_exposure: true unless you need locked brightness for tracking.
+  # If you must lock, tune live and set all three together, e.g.:
+  # exposure: -4
+  # gain: 32
+  # brightness: 64
+  # focus: 0
+  # auto_white_balance: true
 
 tracker:
   max_num_hands: 1
-  min_detection_confidence: 0.7
-  min_hand_presence_confidence: 0.7
-  min_tracking_confidence: 0.7
+  min_detection_confidence: 0.5
+  min_hand_presence_confidence: 0.5
+  min_tracking_confidence: 0.5
   use_gpu: true           # GPU delegate when available; falls back to CPU
   prefer_hand: ""         # "Left" | "Right" | "" (first detected hand)
 
 gestures:
-  debounce_frames: 3      # a gesture must persist N frames before it counts
+  debounce_frames: 2      # gate must read folded N frames before cursor coasts out
 
 pointer:
   filter: one_euro        # one_euro | ema  — one_euro is adaptive (best)
   ema_alpha: 0.35         # used only when filter: ema
   one_euro:               # 1€ filter (Casiez 2012): kills jitter at rest,
-    min_cutoff: 1.2       #   stays snappy in motion (Hz)
-    beta: 0.008           #   speed coefficient — raise to cut lag further
+    min_cutoff: 1.7       #   stays snappy in motion (Hz) — higher = more responsive
+    beta: 0.07            #   speed coefficient — opens cutoff fast on real motion
     d_cutoff: 1.0         #   derivative smoothing (Hz)
-  dead_zone_px: 1         # tiny — the 1€ filter removes jitter, not the dead zone
-  max_jump_ratio: 0.10    # drop frame if cursor jumps > 10% of screen
+  predict_lead_ms: 24     # constant-velocity lead hiding pipeline lag (0 = off)
+  predict_max_px: 48      # clamp so a sudden stop never flings the cursor
+  dead_zone_px: 0         # 0 = glide continuously (any higher makes motion steppy)
+  max_jump_ratio: 0.25    # drop frame if cursor jumps > 25% of screen diagonal
+  max_rejects: 3          # ...but reseed after 3 — genuine moves recover in ~100 ms
+  coast_frames: 5         # hold last pos through blink-length gate loss (~160 ms)
   require_index_extended: true
   motion_area:
     enabled: true
@@ -38,17 +51,109 @@ pointer:
 
 click_lock:
   enabled: true
-  stillness_threshold: 0.005
-  stillness_frames: 10
-  shake_buffer: 5
+  stillness_threshold: 0.003   # per-point velocity EMA below this = still (index + thumb + wrist must ALL agree)
+  stillness_frames: 32          # ...sustained ~1.1 s before freezing — a deliberate hold, not an aiming pause
+  shake_buffer: 8
   shake_min_changes: 3
+  unlock_threshold: 0.012       # motion past this from the lock point votes to release ...
+  unlock_confirm_frames: 2      # ... confirmed 2 frames running, so one jitter spike can't break the lock
+  relock_cooldown_frames: 20    # no re-lock right after an unlock
 
 click:
   pinch_on: 0.25          # normalized pinch RATIO (tip distance / hand size)
   pinch_off: 0.40         # must open wider than this to re-arm (real hysteresis)
-  stable_frames: 3        # pinch must hold this many frames before click
-  cooldown_ms: 400        # block repeat clicks
+  stable_frames: 2        # pinch must hold this many frames before click (was 3)
+  smooth_alpha_up: 0.85   # asymmetric EMA: release snaps back fast ...
+  smooth_alpha_down: 0.5  # ... engagement smooths jitter without added delay
+  cooldown_ms: 250        # block repeat clicks (was 400 — felt unresponsive)
 
 display:
   mirror: true            # flip horizontally so movement feels natural
   show_landmarks: true
+
+game:
+  # Movement keys sent while a direction is held. PBO accepts arrows or
+  # WASD — "both" holds the pair together (arrow+wasd) so a lost-focus
+  # arrow scroll or IME quirk never leaves you standing still.
+  move_keys: both          # arrows | wasd | both
+  keys_enabled_default: true
+  movement:
+    mode: fingers         # fingers = 0/1/2/3/4 count drives UP/DOWN/LEFT/RIGHT
+                          # joystick = legacy palm-position driving
+  fingers:
+    flip_frames: 3        # per-finger pattern must repeat N frames to commit
+    hold_frames: 4        # new direction holds N frames before key presses
+    stop_frames: 2        # fist STOP engages faster (safety)
+    max_unknown_hold: 10  # UNKNOWN blips hold direction this long, then stop
+    pip_thresh: 140.0     # knuckle straightness (deg); ring/pinky auto -10
+    dip_thresh: 130.0
+    straight_thresh: 0.80 # MCP-TIP / polyline; pinky auto -0.05
+  joystick:
+    center_x: 0.5
+    center_y: 0.5
+    deadzone: 0.12        # palm radius around center = STOP (normalized)
+    hold_frames: 2        # new direction repeats N frames before key presses
+    release_frames: 3     # STOP repeats N frames before keys release
+    mirror_x: true        # follow display.mirror (hand right = walk right)
+  actions:
+    pinch_key: space      # A / confirm / talk / interact (both modes)
+    pinch_mouse_click: false  # also emit OS click? keep false in game mode
+    # Below are joystick-mode ONLY (fingers mode uses 0-4 for movement,
+    # so fist/palm/peace never fire taps there — no double meaning).
+    fist_key: x           # B / cancel / back
+    fist_hold_frames: 12  # ~0.4 s @30fps before firing
+    fist_cooldown_ms: 800
+    palm_key: enter       # menu / start
+    palm_hold_frames: 20  # ~0.7 s — deliberate, hard to fire by accident
+    palm_cooldown_ms: 1000
+    run_key: shift        # peace-hold = run modifier (PBO running shoes)
+    run_hold_frames: 6
+    run_release_frames: 6
+  overlay:
+    always_on_top: true   # float over the browser game
+    width: 640
+    help: true
+  # Context: overworld (walk) vs battle (pick moves). Auto-detection is a
+  # screen heuristic — press 'b' anytime to cycle
+  # auto -> force-battle -> force-overworld -> auto.
+  context:
+    mode: auto            # auto | overworld | battle (startup override)
+    probe_interval_s: 0.5 # screenshot+score at ~2 Hz (cheap, runs in loop)
+    threshold: 0.5        # score_battle_screen() >= this = battle reading
+    enter_frames: 3       # consecutive battle readings to enter battle
+    exit_frames: 5        # consecutive overworld readings to leave (slower)
+    roi_bottom: 0.55      # score the bottom 45% where battle menus live
+    templates_dir: assets/battle_templates  # optional user PNGs (matchTemplate)
+    debug: false          # log per-probe scores to console
+  battle:
+    interact: cursor      # cursor = aim with index + pinch-click to select
+                          # taps = 1/2/3/4 fingers tap move_keys (no cursor)
+    move_keys: ["1", "2", "3", "4"]  # tapped for 1/2/3/4 fingers (taps mode)
+    cancel_key: x         # fist in battle = back/cancel (taps mode)
+    stable_frames: 6      # pose must hold N frames before the tap fires
+    cooldown_ms: 1200     # one tap per hold; release + re-show to repeat
+    cursor:
+      mouse_click: true   # pinch fires a real OS left-click (select)
+      key_tap: ""         # optional extra key on pinch (e.g. space), "" = none
+      require_index: true # cursor only moves while index is extended
+      cooldown_ms: 250    # pinch-click repeat guard (uses click.cooldown_ms if absent)
+      lock:
+        enabled: true         # still ~1 s -> cursor auto-locks in battle
+        still_frames: 30      # sustained whole-hand stillness to lock (~1 s)
+        stillness_threshold: 0.003  # per-point EMA speed below this = still
+        unlock_frames: 60     # sustained motion to release (~2 s of movement)
+        motion_threshold: 0.008     # per-point EMA speed reaching this = moving
+        unlock_decay: 3       # still frames drain the unlock meter this fast
+        relock_cooldown_frames: 15  # no snap re-lock right after unlock
+        velocity_alpha: 0.35  # per-point speed EMA (spike rejection)
+  # Two-hand toggle: LEFT "1" + RIGHT "1" held together flips forced
+  # OVERWORLD <-> BATTLE (same 1+1 flips back). Latch-until-release +
+  # cooldown stop bounce; misses only decay the hold meter.
+  duo:
+    enabled: true
+    hold_frames: 8        # ~0.27 s @30fps both-1 hold to toggle
+    miss_decay: 2         # a miss frame subtracts this (gap tolerance)
+    cooldown_s: 1.5       # ignore fresh holds this long after a toggle
+    strict_handedness: false  # true = require Left+Right labels;
+                              # false = any two distinct "1" hands
+    cursor_hand: right     # left | right — hand driving the battle cursor

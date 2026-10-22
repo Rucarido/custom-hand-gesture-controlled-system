@@ -17,12 +17,13 @@ Recognition design (whole-hand, not single-point):
 * After an unlock, re-locking is suppressed for
   ``relock_cooldown_frames`` so the cursor doesn't snap frozen again.
 
-``StillLock`` (below) is the battle-cursor variant with slower,
-deliberate timing: lock after ~1 s of stillness, unlock only after ~2 s
-of *sustained* motion. Pinch exemption is caller-side: game_mode simply
-does not call ``update()`` while a pinch is in progress, so shaping or
-holding a pinch can never break (or make) the lock — the click still
-fires at the frozen position.
+``StillLock`` (below) is the battle-cursor variant with deliberate timing:
+lock after ~0.7 s of rigid-frame stillness, release on a 0.06 hand drift
+(instant) or ~2 s of sustained waving. Its geometry is wrist + middle
+knuckle only, so finger shaping can't fake stillness or motion, and the
+caller ``pause()``s the lock clock during pinch/non-aim frames — a pinch
+can never make or break the lock, and the click still fires at the frozen
+position.
 """
 
 import math
@@ -191,14 +192,19 @@ class ClickLock:
 class StillLock:
     """Auto-lock the battle cursor on stillness; two deliberate unlock paths.
 
-    Same whole-hand signal as ClickLock (index tip + thumb tip + wrist,
-    per-point velocity EMA in normalized landmark units per frame), but
-    timing tuned for "park the cursor, then click in peace":
+    GEOMETRY: stillness, displacement and waving are measured on the hand's
+    rigid frame — wrist (0) and middle knuckle (9) — deliberately NOT on the
+    index tip (cursor proxy) or thumb tip. Finger shaping moves those tips a
+    lot: a pinch approach sweeps the index tip toward the thumb, so tip-based
+    geometry made every click attempt "unlock instantly" right when the user
+    was about to select. The rigid frame is steadier, so locks also acquire
+    more reliably.
 
-    * UNLOCKED: all three points' EMA speed below ``stillness_threshold``
-      for ``still_frames`` in a row (~30 @30fps = 1 s) -> "lock".
+    * UNLOCKED: rigid-frame EMA speed below ``stillness_threshold`` for
+      ``still_frames`` in a row (~20 @30fps = 0.7 s) -> "lock". The anchor
+      is the wrist.
     * LOCKED, two independent release paths:
-      (a) DISPLACEMENT (primary): index tip drifts ``unlock_displacement``
+      (a) DISPLACEMENT (primary): wrist drifts ``unlock_displacement``
           (~0.06 = 6% of frame) away from the lock anchor, confirmed
           ``unlock_confirm_frames`` running (spike out-and-back never
           confirms). Works no matter how slowly the hand travelled — the
@@ -213,22 +219,22 @@ class StillLock:
           (~60 = 2 s of good movement) -> "unlock".
     * After unlock, ``relock_cooldown_frames`` suppress re-locking so the
       tail of the releasing motion doesn't snap frozen again.
-    * Pinch exemption is caller-side: do not call ``update()`` while the
-      pinch channel is anywhere in its lifecycle (approach below the
-      pinch_off ratio, PINCHING, or FIRED). Pinch shaping/release moves
-      thumb+index a lot and would otherwise feed the unlock paths;
-      skipping keeps pinch purely a click action at the frozen cursor.
+    * ``pause()``: call this instead of ``update()`` on frames that must
+      not vote (pinch channel active, model confident the hand is not
+      pointing). It drops the stale previous pose and velocity, so the
+      first frame after a pinch can never read as a huge motion spike.
+      A pinch can therefore neither make nor break the lock.
     """
 
     UNLOCKED = "unlocked"
     LOCKED = "locked"
 
-    _STILL_POINTS = (L.INDEX_TIP, L.THUMB_TIP, L.WRIST)
+    _STILL_POINTS = (L.WRIST, L.MIDDLE_MCP)
 
     def __init__(
         self,
         stillness_threshold: float = 0.003,
-        still_frames: int = 30,
+        still_frames: int = 20,
         motion_threshold: float = 0.008,
         unlock_frames: int = 60,
         unlock_decay: int = 1,
@@ -291,7 +297,7 @@ class StillLock:
                     self.state = self.LOCKED
                     self._still_count = 0
                     self._move_meter = 0
-                    self._anchor = pts[0]  # index tip = cursor proxy
+                    self._anchor = pts[0]  # wrist = hand position
                     self._disp_votes = 0
                     return "lock"
             else:
@@ -331,6 +337,18 @@ class StillLock:
 
     def is_locked(self) -> bool:
         return self.state == self.LOCKED
+
+    def pause(self) -> None:
+        """Skip a frame without voting (pinch active / not aiming).
+
+        Drops the previous pose and EMA velocities so the first frame after
+        the pause can't be read as a giant motion spike (stale-pose unlock).
+        Partial displacement votes are discarded too; the wave meter and the
+        lock/anchor survive untouched.
+        """
+        self._prev = None
+        self._disp_votes = 0
+        self._vel = [0.0] * len(self._STILL_POINTS)
 
     @property
     def move_progress(self) -> float:

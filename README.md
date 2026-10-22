@@ -151,14 +151,15 @@ match the full-frame HaGRID training distribution.
 
 **Behavior:**
 
-1. Hand (whole hand: index tip + thumb tip + wrist, all three must agree) stays still
-   **~1 second** → the cursor **locks itself**. Marker turns red with a `LOCKED` tag, HUD
-   shows `Cursor: LOCKED (x, y)`.
+1. Hand stays still **~0.7 s** → the cursor **locks itself**. Stillness is
+   measured on the hand's rigid frame — wrist + middle knuckle — so finger
+   shaping (pinch approach, index wiggles) neither delays nor breaks a lock.
+   Marker turns red with a `LOCKED` tag, HUD shows `Cursor: LOCKED (x, y)`.
 2. While locked, the OS cursor is never moved — it stays parked — **but pinch still
-   selects**: pinch-clicks land exactly on the frozen spot. Lock updates are skipped while
-   pinching (pinch shaping moves thumb+index a lot), and in battle-cursor mode the lock
-   additionally only listens while the trained model reads the hand as **pointing** (§2.5)
-   — so a pinch can neither make nor break the lock.
+   selects**: pinch-clicks land exactly on the frozen spot. Pinch/non-aim frames
+   *pause* the lock clock instead of voting, and a brief aim dropout (< 0.5 s, e.g.
+   the index bending through a pinch) keeps the lock instead of resetting it — a
+   pinch can neither make nor break the lock (§2.5 gates aiming with the model).
 3. **Two deliberate unlock paths** (either one frees the cursor, `! CURSOR FREE`):
    - **Drift (primary):** the hand moves `> 0.06` normalized units from the lock point,
      confirmed 3 running frames — unlock is immediate even at ordinary aiming speed (no
@@ -176,7 +177,7 @@ Tuning (`config/settings.yaml` → `game.battle.cursor.lock`, all @ ~30 fps):
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `true` | Set `false` for a permanently free cursor |
-| `still_frames` | `30` | Sustained stillness to lock (~1 s) |
+| `still_frames` | `20` | Sustained rigid-frame stillness to lock (~0.7 s) |
 | `stillness_threshold` | `0.003` | Per-point EMA speed below this = still |
 | `unlock_displacement` | `0.06` | Primary unlock: drift past this from the lock spot |
 | `unlock_confirm_frames` | `3` | ...confirmed for N running frames (spikes never confirm) |
@@ -309,7 +310,7 @@ BlazeHand
 │   ├── hagrid-150k/       # full 150k-image HaGRID classification mirror
 │   ├── hagrid-150k-256/   # 256px working copy (faster decode)
 │   └── hagrid-mini/       # 2,850-image course subset (150/class, §9)
-├── tests/                 # hardware-free suite: 69 tests
+├── tests/                 # hardware-free suite: 71 tests
 │   ├── test_precision.py  # pinch, filters, pointer gate, ClickLock
 │   ├── test_game.py       # finger states, joystick, key controller
 │   ├── test_game_context.py
@@ -326,7 +327,7 @@ Failsafes everywhere: hand lost → keys released + state reset; any exception �
 
 ```powershell
 .venv/Scripts/python -m pytest tests/ -q
-# 69 passed
+# 71 passed
 ```
 
 Hardware-facing modules (`tracker`, `camera`, `main`, live screen scorer) are excluded by

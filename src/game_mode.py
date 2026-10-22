@@ -29,7 +29,7 @@ single-frame misses only decay (never reset) the hold meter.
     index tip drives the OS cursor (smoothed, jump-guarded); pinch clicks
     to select. Fist parks the cursor (index gate closes, coast holds).
     Lower one hand and point with the other to aim.
-    CURSOR-LOCK (battle.cursor.lock): hand still ~1 s -> the cursor
+    CURSOR-LOCK (battle.cursor.lock): hand still ~0.7 s -> the cursor
     freezes by itself; pinch does NOT break the lock — it just clicks at
     the frozen spot. Move the hand away from the lock point (any speed)
     or wave it ~2 s to release it again. The lock only listens while the
@@ -317,7 +317,7 @@ def run_game() -> None:
     )
     _cursor_id: str | None = None  # handedness driving the cursor
 
-    # --- battle auto-lock (still ~1 s -> freeze; reposition/wave -> free) ---
+    # --- battle auto-lock (still ~0.7 s -> freeze; reposition/wave -> free) ---
     lock_cfg = cur_cfg.get("lock", {}) or {}
     still_lock = StillLock(
         stillness_threshold=lock_cfg.get("stillness_threshold", 0.003),
@@ -334,6 +334,7 @@ def run_game() -> None:
     _frozen: tuple[int, int] | None = None  # OS cursor pos held while locked
     lock_px = None  # overlay marker pos frozen at lock time (frame px)
     _last_sent: tuple[int, int] | None = None  # last accepted cursor pos
+    _lost_frames = 0  # consecutive frames with no usable aiming hand
 
     # --- trained gesture classifier (battle-cursor aim + lock gating) ---
     # "Is the hand pointing up?" comes from the trained HaGRID model
@@ -351,7 +352,7 @@ def run_game() -> None:
     _clf_i = 0
 
     def _reset_cursor_nav():
-        nonlocal _frozen, lock_px, _last_sent
+        nonlocal _frozen, lock_px, _last_sent, _lost_frames
         cursor_mapper.reset()
         cursor_smoother.reset()
         cursor_predictor.reset()
@@ -362,6 +363,7 @@ def run_game() -> None:
         _frozen = None
         lock_px = None
         _last_sent = None
+        _lost_frames = 0
 
     def _switch_context(target: str, why: str):
         """Force a context switch with full input-state reset."""
@@ -437,7 +439,7 @@ def run_game() -> None:
             _gate = ("trained model (pointing)" if clf is not None
                      and clf.available else "rule index gate")
             print("[game] CURSOR-LOCK: still "
-                  f"{still_lock.still_frames} frames (~1s) -> lock "
+                  f"{still_lock.still_frames} frames (~0.7s) -> lock "
                   f"[aim gate: {_gate}]; move hand away "
                   f"(>{still_lock.unlock_displacement:.2f}) or wave "
                   f"~{still_lock.unlock_frames} frames -> free")
@@ -591,6 +593,7 @@ def run_game() -> None:
                         allow_first=_ai_pointing is True,
                     )
                     if _ci != -1:
+                        _lost_frames = 0
                         _ch = hands_info[_ci]
                         _clm = _ch["landmarks"]
                         _clabel = _ch["handedness"]
@@ -615,6 +618,10 @@ def run_game() -> None:
                         #     so it stays excluded here too.
                         #   - model unsure -> rule index_extended decides.
                         #   - model confident non-pointing -> skip.
+                        # Non-voting frames call pause(): the stale pose is
+                        # dropped, so the first frame after a pinch can't
+                        # read as a motion spike (that spike used to unlock
+                        # the cursor right as the user was about to click).
                         if (lock_enabled and cursor_pinch.state
                                 == PinchClickDetector.OPEN):
                             if _ai_pointing is True:
@@ -623,10 +630,13 @@ def run_game() -> None:
                                 _feed_lock = bool(_ch.get("index_extended"))
                             else:
                                 _feed_lock = False
-                            lock_event = (
-                                still_lock.update(_clm) if _feed_lock else None
-                            )
+                            if _feed_lock:
+                                lock_event = still_lock.update(_clm)
+                            else:
+                                still_lock.pause()
+                                lock_event = None
                         else:
+                            still_lock.pause()
                             lock_event = None
                         _raw_c = cursor_mapper.landmarks_to_screen(_clm)
                         if _raw_c is not None:
@@ -705,15 +715,28 @@ def run_game() -> None:
                                     f"{cursor_cooldown.remaining_ms:.0f}ms"
                                 )
                     else:
-                        _cursor_id = None
-                        cursor_pinch.reset()
-                        # Aiming hand vanished mid-lock would otherwise
-                        # strand a parked cursor: reset the lock so the
-                        # re-entering hand starts fresh.
-                        still_lock.reset()
-                        _frozen = None
-                        lock_px = None
-                        hud.append("Cursor: no pointing hand")
+                        _lost_frames += 1
+                        # A pinch bends the index / the classifier may flip
+                        # to non-pointing for a few frames. Instantly
+                        # nuking the lock here is what made the cursor
+                        # "unlock right as I'm about to click". If a hand
+                        # is still visible (fist = park, pinch = shaping)
+                        # the lock just rides through; a hand that truly
+                        # vanishes gets a ~0.5 s grace, then resets.
+                        if still_lock.is_locked() and (
+                                hands_info or _lost_frames <= 15):
+                            still_lock.pause()
+                            hud.append("Cursor: LOCKED (no aim)")
+                        else:
+                            _cursor_id = None
+                            cursor_pinch.reset()
+                            # Aiming hand vanished mid-lock would otherwise
+                            # strand a parked cursor: reset the lock so the
+                            # re-entering hand starts fresh.
+                            still_lock.reset()
+                            _frozen = None
+                            lock_px = None
+                            hud.append("Cursor: no pointing hand")
                     hud.append(f"Aim: CURSOR ({cursor_prefer} hand)")
                 elif context == BATTLE:
                     # --- battle: fingers = move taps, fist = cancel ---

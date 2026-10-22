@@ -138,9 +138,11 @@ game:
       require_index: true # cursor only moves while index is extended
       cooldown_ms: 250    # pinch-click repeat guard (uses click.cooldown_ms if absent)
       lock:
-        enabled: true          # still ~1 s -> cursor auto-locks in battle
-        still_frames: 30      # sustained whole-hand stillness to lock (~1 s)
+        enabled: true          # still ~0.7 s -> cursor auto-locks in battle
+        still_frames: 20      # sustained rigid-frame stillness to lock
         stillness_threshold: 0.003  # per-point EMA speed below this = still
+                                    # (points = wrist + middle knuckle: finger
+                                    #  shaping can neither make nor break it)
         unlock_displacement: 0.06   # PRIMARY unlock: hand drifts this far
                                     # from the lock point (any speed) -> free
         unlock_confirm_frames: 3   # ...confirmed N frames (spikes never confirm)

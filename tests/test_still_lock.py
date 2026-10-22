@@ -1,14 +1,13 @@
 """StillLock tests — hardware-free (no cv2/mediapipe/pynput).
 
-Battle-cursor auto-lock contract: ~1 s whole-hand stillness -> "lock";
-then TWO release paths — (a) displacement: index tip drifts
-``unlock_displacement`` from the lock anchor (ANY speed — the old
-wave-meter-only design stalled forever on slow repositioning), confirmed
-``unlock_confirm_frames`` running so spikes never confirm; (b) waving:
-sustained motion with a gentle x1 drain (the old x3 drain canceled all
-progress on any pause, so the meter needed 75% moving frames and simply
-never fired for many users). Pinch exemption is caller-side (game_mode
-skips updates until the pinch channel is fully idle).
+Battle-cursor auto-lock contract: ~0.7 s rigid-frame stillness -> "lock".
+The rigid frame is wrist + middle knuckle; fingertip motion (pinch shaping,
+index wiggles) must neither make nor break the lock. Two release paths:
+(a) displacement: wrist drifts ``unlock_displacement`` from the anchor (ANY
+speed), confirmed ``unlock_confirm_frames`` running so spikes never confirm;
+(b) waving: sustained rigid-frame motion with a gentle x1 drain.
+``pause()`` lets the caller skip pinch / non-aim frames without leaving a
+stale pose behind (that stale-pose spike used to unlock right before clicks).
 """
 
 import sys
@@ -20,11 +19,13 @@ from click_lock import StillLock  # noqa: E402
 
 
 def _lm(x, y, tx=None, ty=None, wx=None, wy=None):
-    """21-landmark stub; index(8)/thumb(4)/wrist(0) placed, rest centered."""
-    lm = [[0.5, 0.5, 0.0] for _ in range(21)]
+    """21-landmark stub. Hand pose = wrist(0) + middle knuckle(9).
+    Index tip(8)/thumb tip(4) are decoration the lock must ignore."""
+    lm = [[x, y, 0.0] for _ in range(21)]
     lm[8] = [x, y, 0.0]
     lm[4] = [x if tx is None else tx, y if ty is None else ty, 0.0]
     lm[0] = [x if wx is None else wx, y if wy is None else wy, 0.0]
+    lm[9] = [x if wx is None else wx, y if wy is None else wy, 0.0]
     return lm
 
 
@@ -75,15 +76,18 @@ def test_motion_prevents_lock():
     assert not lock.is_locked()
 
 
-def test_thumb_motion_alone_blocks_lock():
-    # Shaping a pinch (thumb travelling, rest steady) must NOT lock.
+def test_finger_shaping_does_not_block_lock():
+    # Lock geometry is wrist+knuckle only: shaping a pinch (thumb/index
+    # travelling, hand itself still) must NOT stall the lock — that
+    # starvation is exactly what made "time to lock" feel broken while
+    # the user was lining up a click.
     lock = _new()
     events = []
     for i in range(20):
         t = 0.5 + (0.01 if i % 2 == 0 else -0.01)
         events.append(lock.update(_lm(0.5, 0.5, tx=t, ty=0.5)))
-    assert "lock" not in events
-    assert not lock.is_locked()
+    assert "lock" in events
+    assert lock.is_locked()
 
 
 # --- unlock path (a): displacement, speed-independent -------------------------
@@ -170,6 +174,37 @@ def test_still_while_locked_stays_locked():
         assert lock.update(_still()) is None
     assert lock.is_locked()
     assert lock.move_progress == 0.0
+
+
+def test_pinch_shaping_while_locked_does_not_unlock():
+    # THE user-reported regression: while locked, a pinch approach sweeps
+    # the index tip toward the thumb. When the lock watched the index tip
+    # this counted as "hand moved away" and fired unlock mid-click.
+    lock = _new()
+    _lock_it(lock)
+    for i in range(40):
+        step = min(i, 8) * 0.04
+        assert lock.update(
+            _lm(0.5 - step, 0.5, tx=0.5 + step, ty=0.5, wx=0.5, wy=0.5)
+        ) is None
+    assert lock.is_locked()
+
+
+def test_pause_keeps_lock_without_stale_spike():
+    # Pinch / non-aim frames call pause() instead of update(). The hand
+    # drifts 0.03 (inside the unlock radius) meanwhile; resuming must not
+    # read the skipped gap as a huge motion spike.
+    lock = _new()
+    _lock_it(lock)
+    for _ in range(40):
+        lock.pause()
+    for _ in range(10):
+        assert lock.update(_still(0.53)) is None
+    assert lock.is_locked()
+    # Anchor survived the pause: a real reposition still unlocks.
+    for _ in range(4):
+        lock.update(_still(0.6))
+    assert not lock.is_locked()
 
 
 # --- cooldown / reset ----------------------------------------------------------

@@ -7,3 +7,7 @@ pyautogui
 # NOTE: do NOT add tensorflow — src/ never imports it, and installing it
 # breaks mediapipe on Python 3.14 / locked-down Windows (DLL blocked).
 # MediaPipe only needs it for doc generation and already handles it missing.
+#
+# Optional — trained gesture model for battle-cursor aim/lock (README §2.5/§8):
+#   .venv/Scripts/python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+# The game runs fully rule-based without it (auto-detected).

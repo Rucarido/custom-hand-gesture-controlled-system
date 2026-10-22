@@ -409,12 +409,19 @@ def is_duo_one_one(hands_info, strict_handedness: bool = False) -> bool:
     return "Left" in labels and "Right" in labels
 
 
-def pick_cursor_hand(hands_info, prefer: str = "Right") -> int:
+def pick_cursor_hand(hands_info, prefer: str = "Right",
+                     allow_first: bool = False) -> int:
     """Index into hands_info driving the battle cursor, or -1.
 
     Preference order: preferred-handed hand with index extended, then any
     hand with index extended. Hands making a fist (or lost tracking) never
     drive the cursor, so shaping taps elsewhere can't yank the pointer.
+
+    ``allow_first``: when NO hand passes the index gate (rule flicker on
+    a borderline pointing pose), fall back to the preferred-handed — or
+    first — hand. The trained classifier vouches that someone is pointing
+    (its confident "pointing" verdict also bypasses the rule gate), so
+    the cursor shouldn't drop just because the geometry gate blinked.
     """
     best = -1
     for i, h in enumerate(hands_info):
@@ -423,7 +430,14 @@ def pick_cursor_hand(hands_info, prefer: str = "Right") -> int:
                 return i
             if best == -1:
                 best = i
-    return best
+    if best != -1:
+        return best
+    if not allow_first or not hands_info:
+        return -1
+    for i, h in enumerate(hands_info):
+        if str(h.get("handedness", "")) == prefer:
+            return i
+    return 0
 
 
 class DuoToggle:

@@ -1,9 +1,14 @@
 """StillLock tests — hardware-free (no cv2/mediapipe/pynput).
 
-Battle-cursor auto-lock: ~1 s whole-hand stillness -> "lock", ~2 s of
-sustained motion -> "unlock". Pinch exemption is caller-side (game_mode
-skips update() while pinching), so these tests cover the class contract:
-lock timing, motion-meter unlock, spike/drain behavior, cooldown.
+Battle-cursor auto-lock contract: ~1 s whole-hand stillness -> "lock";
+then TWO release paths — (a) displacement: index tip drifts
+``unlock_displacement`` from the lock anchor (ANY speed — the old
+wave-meter-only design stalled forever on slow repositioning), confirmed
+``unlock_confirm_frames`` running so spikes never confirm; (b) waving:
+sustained motion with a gentle x1 drain (the old x3 drain canceled all
+progress on any pause, so the meter needed 75% moving frames and simply
+never fired for many users). Pinch exemption is caller-side (game_mode
+skips updates until the pinch channel is fully idle).
 """
 
 import sys
@@ -32,8 +37,10 @@ def _new(**over):
         stillness_threshold=0.003,
         still_frames=5,
         motion_threshold=0.008,
-        unlock_frames=6,
-        unlock_decay=3,
+        unlock_frames=50,      # wave path ~off unless a test opts in
+        unlock_decay=1,
+        unlock_displacement=0.06,
+        unlock_confirm_frames=3,
         relock_cooldown_frames=15,
         velocity_alpha=0.35,
     )
@@ -45,6 +52,9 @@ def _lock_it(lock, x=0.5, y=0.5, frames=10):
     for _ in range(frames):
         lock.update(_still(x, y))
     assert lock.is_locked()
+
+
+# --- locking -----------------------------------------------------------------
 
 
 def test_locks_after_sustained_stillness():
@@ -60,7 +70,6 @@ def test_locks_after_sustained_stillness():
 def test_motion_prevents_lock():
     lock = _new()
     for i in range(30):
-        # drift every other frame: still counter never completes
         x = 0.5 + (0.02 if i % 2 == 0 else 0.0)
         assert lock.update(_still(x)) is None
     assert not lock.is_locked()
@@ -68,7 +77,6 @@ def test_motion_prevents_lock():
 
 def test_thumb_motion_alone_blocks_lock():
     # Shaping a pinch (thumb travelling, rest steady) must NOT lock.
-    # Extra class-level safety on top of game_mode skipping pinch frames.
     lock = _new()
     events = []
     for i in range(20):
@@ -78,13 +86,68 @@ def test_thumb_motion_alone_blocks_lock():
     assert not lock.is_locked()
 
 
-def test_sustained_motion_unlocks():
+# --- unlock path (a): displacement, speed-independent -------------------------
+
+
+def test_slow_repositioning_unlocks():
+    """THE regression: drift slower than motion_threshold must still unlock.
+
+    Old wave-meter-only design: EMA speed 0.005 < 0.008 -> zero motion
+    votes -> meter stayed 0 forever -> cursor parked while the hand
+    travelled away and pinch-clicked the WRONG spot.
+    """
     lock = _new()
+    _lock_it(lock, x=0.5)
+    x = 0.5
+    events = []
+    for _ in range(20):
+        x += 0.005  # deliberate slow travel, below the wave threshold
+        events.append(lock.update(_still(x)))
+    assert "unlock" in events
+    assert not lock.is_locked()
+
+
+def test_far_move_and_hold_unlocks():
+    # Reposition to a new spot and park there: unlock (that's the point —
+    # the hand is clearly somewhere else; the cursor must follow again).
+    lock = _new()
+    _lock_it(lock, x=0.5)
+    x = 0.5
+    events = []
+    for _ in range(3):
+        x += 0.02
+        events.append(lock.update(_still(x)))   # d reaches 0.06
+    for _ in range(5):
+        events.append(lock.update(_still(x)))   # hold far -> confirm
+    assert "unlock" in events
+    assert not lock.is_locked()
+
+
+def test_displacement_spike_does_not_unlock():
+    # Out-and-back jumps never keep 3 confirmation votes in a row.
+    lock = _new()
+    _lock_it(lock, x=0.5)
+    events = []
+    for _ in range(5):  # 2 frames far (d=0.08), 2 frames back home
+        events.append(lock.update(_still(0.58)))
+        events.append(lock.update(_still(0.58)))
+        events.append(lock.update(_still(0.5)))
+        events.append(lock.update(_still(0.5)))
+    assert "unlock" not in events
+    assert lock.is_locked()
+
+
+# --- unlock path (b): sustained waving ----------------------------------------
+
+
+def test_sustained_waving_unlocks():
+    # Oscillation IN PLACE (no net displacement): wave meter must fire.
+    lock = _new(unlock_frames=5)
     _lock_it(lock)
     events = []
     x = 0.5
-    for _ in range(12):
-        x += 0.02  # deliberate continuous travel
+    for i in range(15):
+        x = 0.5 + (0.02 if i % 2 == 0 else -0.02)
         events.append(lock.update(_still(x)))
     assert "unlock" in events
     assert not lock.is_locked()
@@ -93,9 +156,8 @@ def test_sustained_motion_unlocks():
 def test_single_spike_does_not_unlock():
     lock = _new()
     _lock_it(lock)
-    # one out-and-back jump, then dead still: meter peaks well under 6
-    assert lock.update(_still(0.53)) is None
-    assert lock.update(_still(0.5)) is None
+    assert lock.update(_still(0.53)) is None  # lone jump out...
+    assert lock.update(_still(0.5)) is None  # ...and back
     for _ in range(10):
         assert lock.update(_still(0.5)) is None
     assert lock.is_locked()
@@ -110,38 +172,27 @@ def test_still_while_locked_stays_locked():
     assert lock.move_progress == 0.0
 
 
-def test_move_and_hold_does_not_unlock():
-    # 3 motion frames (~2 votes) then still drains the meter; repeating
-    # that pattern must never accumulate to unlock_frames=6.
-    lock = _new()
-    _lock_it(lock)
-    x = 0.5
-    for _ in range(6):
-        for _ in range(3):
-            x += 0.02
-            assert lock.update(_still(x)) is None
-        for _ in range(6):
-            assert lock.update(_still(x)) is None
-    assert lock.is_locked()
+# --- cooldown / reset ----------------------------------------------------------
 
 
 def test_relock_cooldown_then_relock():
-    lock = _new()
+    lock = _new(unlock_frames=5)
     _lock_it(lock)
     x = 0.5
-    for _ in range(12):
-        x += 0.02
-        lock.update(_still(x))
-        if not lock.is_locked():
+    unlocked_at = None
+    for i in range(20):  # wave in place until the unlock fires
+        x = 0.5 + (0.02 if i % 2 == 0 else -0.02)
+        if lock.update(_still(x)) == "unlock":
+            unlocked_at = i
             break
-    assert not lock.is_locked()  # released by motion; cooldown now full
-    # ... hand stops dead: cooldown suppresses snap re-lock ...
+    assert unlocked_at is not None
+    # ... hand stops dead: cooldown (15) suppresses snap re-lock ...
     for _ in range(14):
         assert lock.update(_still(x)) is None
     assert not lock.is_locked()
-    # ... then normal stillness locks again.
-    events = [lock.update(_still(x)) for _ in range(8)]
-    assert "lock" in events
+    # ... then normal stillness locks again at the new spot.
+    relock = [lock.update(_still(x)) for _ in range(8)]
+    assert "lock" in relock
     assert lock.is_locked()
 
 
@@ -151,5 +202,4 @@ def test_reset_clears_everything():
     lock.reset()
     assert not lock.is_locked()
     assert lock.move_progress == 0.0
-    # fresh instance behavior: first frame seeds, no crash, no lock
     assert lock.update(_still()) is None

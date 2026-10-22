@@ -119,6 +119,29 @@ No cursor. The same finger counts become **single key taps** (not held keys):
 after any tap blocks the next one — morphing 1→2 through a fist flash can't double-fire
 cancel. `UNKNOWN` frames neither advance nor break the streak.
 
+### 2.5 AI aim gate (`gesture_classifier.py`, trained model)
+
+Battle-cursor aim no longer trusts raw finger angles alone. The trained model
+(`models/blazehand-mini/best.pt`, MobileNetV3-Small, 94.7 % accuracy — §8) classifies the
+**full camera frame** every N frames (~12 ms on a laptop GPU, cached between runs) and
+answers one question: *is the hand pointing up?*
+
+- **Confident pointing** (`one` → `index_only`, `conf ≥ conf_min`) → the rule-based index
+  gate is bypassed for the cursor mapper (borderline geometry used to flicker and freeze
+  the cursor mid-aim), and the auto-lock is allowed to listen. This is what fixes the
+  battle "time to lock": a pointing hand holds pinch ratio ~0.3–0.4, so the old
+  `ratio ≥ pinch_off` gate **never fed the lock while actually aiming**.
+- **Confident non-pointing** → auto-lock feed skipped; pinch shaping reads as a
+  non-pointing class, so a pinch can neither make nor break the lock.
+- **Model unsure** (`conf < conf_min`) → falls back to the rule-based `index_extended`
+  gate per frame (old behavior, minus the ratio-starvation bug).
+
+Config `game.battle.cursor.classifier`: `enabled`, `model`, `conf_min: 0.50`,
+`pointing_poses: ["index_only"]`, `every_n_frames: 1`. Torch is optional — if it or the
+checkpoint is missing, the game prints a notice and stays purely rule-based (§8 install
+line). Inference runs on the **pristine** frame (copied before landmarks/HUD are drawn) to
+match the full-frame HaGRID training distribution.
+
 ---
 
 ## 3. Battle-cursor auto-lock (`StillLock`)
@@ -132,13 +155,19 @@ cancel. `UNKNOWN` frames neither advance nor break the streak.
    **~1 second** → the cursor **locks itself**. Marker turns red with a `LOCKED` tag, HUD
    shows `Cursor: LOCKED (x, y)`.
 2. While locked, the OS cursor is never moved — it stays parked — **but pinch still
-   selects**: pinch-clicks land exactly on the frozen spot. Pinch shaping moves
-   thumb+index a lot, so the lock **never even sees pinch frames** (updates are skipped
-   while pinching, same freeze precedent as the walk driver). A pinch can neither make
-   nor break the lock.
-3. **~2 seconds of real hand motion** releases it (`! CURSOR FREE`). A lone jitter spike
-   contributes at most +1 to the unlock meter and drains away; move-and-hold stalls out.
-   15-frame relock cooldown stops the tail of the releasing motion from snap-freezing.
+   selects**: pinch-clicks land exactly on the frozen spot. Lock updates are skipped while
+   pinching (pinch shaping moves thumb+index a lot), and in battle-cursor mode the lock
+   additionally only listens while the trained model reads the hand as **pointing** (§2.5)
+   — so a pinch can neither make nor break the lock.
+3. **Two deliberate unlock paths** (either one frees the cursor, `! CURSOR FREE`):
+   - **Drift (primary):** the hand moves `> 0.06` normalized units from the lock point,
+     confirmed 3 running frames — unlock is immediate even at ordinary aiming speed (no
+     more "wave for 2 seconds" just to re-aim).
+   - **Wave:** ~2 s of sustained motion fills the unlock meter; still frames drain it by
+     only 1 per frame, so a brief pause no longer cancels all wave progress. A lone
+     jitter spike contributes at most +1 and drains away.
+   A 15-frame relock cooldown after unlock stops the tail of the releasing motion from
+   snap-freezing.
 4. The smoothing chain keeps tracking the live hand *during* the lock, so release resyncs
    instantly with no teleport (jump guard reseeds on unlock).
 
@@ -149,9 +178,11 @@ Tuning (`config/settings.yaml` → `game.battle.cursor.lock`, all @ ~30 fps):
 | `enabled` | `true` | Set `false` for a permanently free cursor |
 | `still_frames` | `30` | Sustained stillness to lock (~1 s) |
 | `stillness_threshold` | `0.003` | Per-point EMA speed below this = still |
-| `unlock_frames` | `60` | Sustained motion to release (~2 s) |
+| `unlock_displacement` | `0.06` | Primary unlock: drift past this from the lock spot |
+| `unlock_confirm_frames` | `3` | ...confirmed for N running frames (spikes never confirm) |
+| `unlock_frames` | `60` | Sustained motion to release (~2 s of waving) |
 | `motion_threshold` | `0.008` | Per-point EMA speed reaching this = moving |
-| `unlock_decay` | `3` | Still frames drain the unlock meter this fast |
+| `unlock_decay` | `1` | Still frames drain the wave meter this fast |
 | `relock_cooldown_frames` | `15` | No snap re-lock right after unlock |
 | `velocity_alpha` | `0.35` | Per-point speed EMA (spike rejection) |
 
@@ -182,7 +213,7 @@ thresholds second. Class: `StillLock` in `src/click_lock.py` (the older `ClickLo
 | 1 / 2 / 3 / 4 fingers | walk U / D / L / R | aim hand shape (cursor follows index) | tap `1`–`4` |
 | pinch | confirm (`Space`) | **click to select** | confirm (`Space`) |
 | still ~1 s (cursor) | — | **auto-lock** (pinch still clicks) | — |
-| 2 s motion (cursor) | — | release lock | — |
+| move hand away or 2 s motion (cursor) | — | release lock | — |
 | `1+1` both hands (~0.27 s) | → force battle-cursor | → force movement | → force movement |
 
 ### Game-mode keyboard map (overlay window focused)
@@ -255,6 +286,7 @@ BlazeHand
 │   ├── pointer.py         # index-tip -> screen mapping + gates
 │   ├── filters.py         # 1€/EMA smoothing, predictor, dead-zone, jump guard
 │   ├── landmarks.py       # 21-point geometry helpers
+│   ├── gesture_classifier.py  # trained model wrapper (battle aim gate, §2.5)
 │   ├── actions.py         # OS mouse backend (pynput)
 │   ├── camera.py          # webcam capture + warmup
 │   ├── overlay.py         # debug drawing (landmarks, motion area, lock frame)
@@ -262,7 +294,22 @@ BlazeHand
 │   └── model_utils.py     # hand_landmarker.task auto-download
 ├── config/settings.yaml   # all tunables (see §5)
 ├── models/hand_landmarker.task
-├── tests/                 # hardware-free suite: 66 tests
+├── models/blazehand-mini/ # trained gesture classifier (see §9)
+│   ├── best.pt            # MobileNetV3-Small, 19 classes, ~6 MB
+│   ├── labels.json        # class list + HaGRID→BlazeHand pose map
+│   ├── metrics.txt        # per-class precision/recall/F1 on val split
+│   └── confusion_matrix.npz
+├── training/              # dataset + training scripts (see §8)
+│   ├── train_gesture.py   # optimized RTX 4050 training loop
+│   ├── check_classifier.py # sanity check: best.pt through the game wrapper
+│   ├── make_subset.py     # stratified mini-subset builder
+│   ├── extract_dataset.py # unzip helper (strips top folder)
+│   └── resize_dataset.py  # one-time 512px→256px shrink (multiprocess)
+├── data/                  # datasets (git-ignored, local only)
+│   ├── hagrid-150k/       # full 150k-image HaGRID classification mirror
+│   ├── hagrid-150k-256/   # 256px working copy (faster decode)
+│   └── hagrid-mini/       # 2,850-image course subset (150/class, §9)
+├── tests/                 # hardware-free suite: 69 tests
 │   ├── test_precision.py  # pinch, filters, pointer gate, ClickLock
 │   ├── test_game.py       # finger states, joystick, key controller
 │   ├── test_game_context.py
@@ -279,14 +326,86 @@ Failsafes everywhere: hand lost → keys released + state reset; any exception �
 
 ```powershell
 .venv/Scripts/python -m pytest tests/ -q
-# 66 passed
+# 69 passed
 ```
 
 Hardware-facing modules (`tracker`, `camera`, `main`, live screen scorer) are excluded by
 design (`tests/conftest.py`); pure logic (landmarks, filters, gesture drivers, locks,
 context smoother, duo toggle) is fully covered with synthetic hands.
 
-## 8. Troubleshooting
+## 8. Training the gesture classifier (course-project path)
+
+The rule-based finger voter (§2.1) works, but it is pure geometry — cluttered backgrounds
+still break it at the *detection* stage. The trained alternative below learns appearance
+directly, so diverse real-world backgrounds stop mattering.
+
+**Dataset** (already in the project, git-ignored under `data/`):
+[`cj-mills/hagrid-classification-512p-no-gesture-150k-zip`](https://huggingface.co/datasets/cj-mills/hagrid-classification-512p-no-gesture-150k-zip)
+(Hugging Face mirror of [HaGRID](https://github.com/hukenovs/hagrid), Kapitanov et al.,
+WACV 2024) — **153,735 images, 19 classes** (`fist`, `one`, `peace`, `three`, `four`,
+`palm`, `stop`, … plus a `no_gesture` class), photographed by thousands of people in real
+rooms. **License: CC BY-SA 4.0** — if you publish the model, credit HaGRID.
+For course scope we train on a stratified mini-subset, `data/hagrid-mini/`
+(**2,850 images, 150/class**, built with `training/make_subset.py --per-class 150`).
+
+**Train** (system Python — it owns the CUDA torch; game code stays on `.venv`):
+
+```powershell
+# 60-second pipeline check (2 classes, 1 epoch, proves GPU path)
+python training/train_gesture.py --data data/hagrid-mini --smoke --out-dir models/smoke-test
+# real run (~7 min on RTX 4050 6GB: mixed precision, channels-last, OneCycleLR,
+# label smoothing, weighted sampling for the no_gesture majority)
+python training/train_gesture.py --data data/hagrid-mini --epochs 40 --aug strong `
+  --dropout 0.3 --batch-size 64 --out-dir models/blazehand-mini --export-onnx
+# resume / continue any interrupted run:
+python training/train_gesture.py --data data/hagrid-mini --epochs 60 `
+  --resume models/blazehand-mini/last.pt
+```
+
+Optimized for the RTX 4050 6 GB: ImageNet-pretrained MobileNetV3-Small (~2.5 M params),
+AMP + `channels_last`, `cudnn.benchmark`, pinned-memory multi-worker loading, AdamW +
+OneCycleLR, best-by-val-macro-F1 checkpointing with Ctrl+C-safe resume (`last.pt`).
+
+**Result on the held-out 10 % split — accuracy 0.947, macro-F1 0.948:**
+
+| BlazeHand pose | HaGRID class(es) | Val F1 |
+|---|---|---|
+| `fist` (STOP) | `fist` | 0.97 |
+| `index_only` (UP) | `one` | 0.84 |
+| `peace` (DOWN) | `peace`, `two_up` | 0.80 – 0.90 |
+| `three` (LEFT) | `three`, `three2` | 0.97 |
+| `four` (RIGHT) | `four`, `palm`, `stop` | 0.97 – 1.00 |
+| none (no action) | `no_gesture` + the rest | 0.88 – 1.00 |
+
+Honest weak spots (good report material): `one` (0.84) and `peace` (0.80) confuse each
+other and their inverted twins most — 1-vs-2 raised fingers is the hardest fine-grained
+split, and 150 samples/class is small. More samples of exactly those classes, or merging
+`peace`/`two_up` at the label level, would be the first follow-up. The `labels.json`
+`blazehand_map` already encodes the class→pose mapping above (unmapped classes → no
+action), so the game can consume it directly.
+
+**Artifacts:** `models/blazehand-mini/best.pt` (6 MB, val-best weights), `labels.json`
+(classes + BlazeHand map + license), `metrics.txt` + `confusion_matrix.npz` (per-class
+report), `training_log.csv`, `last.pt` (resume state). ONNX export (`--export-onnx`) is
+implemented but **blocked on locked-down Windows** (App Control policy rejects onnx's
+native DLL — same reason `src/` avoids tensorflow); `best.pt` + `labels.json` are complete
+for PyTorch inference, export the `.onnx` on an unrestricted machine if needed.
+
+**Live integration:** wired into battle-cursor mode as the aim gate (§2.5) — it runs on
+full frames (the training distribution; hand crops are out-of-distribution for this model),
+logging `[ai] loaded …` at startup and `AI: <class> <conf>` in the HUD while in battle.
+Install the runtime under `.venv` once:
+
+```powershell
+.venv/Scripts/python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+.venv/Scripts/python training/check_classifier.py   # 5-image + latency sanity check
+```
+
+If torch is absent the game degrades to the rule-based gate automatically. Pinch and the
+two-hand `1+1` toggle have no public-dataset equivalent, so those still run on rules; the
+`data/custom/<class>/` pattern slots straight into `ImageFolderList` if that changes.
+
+## 9. Troubleshooting
 
 | Symptom | Try |
 |---|---|

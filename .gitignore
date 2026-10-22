@@ -12,5 +12,8 @@ __pycache__/
 *.pyzw
 .env
 
+# local datasets + training artifacts (regenerable, too big to commit)
+/data/
+
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 /graft/

@@ -25,6 +25,8 @@ holding a pinch can never break (or make) the lock — the click still
 fires at the frozen position.
 """
 
+import math
+
 import landmarks as L
 
 
@@ -187,7 +189,7 @@ class ClickLock:
 
 
 class StillLock:
-    """Auto-lock the battle cursor on stillness; slow deliberate unlock.
+    """Auto-lock the battle cursor on stillness; two deliberate unlock paths.
 
     Same whole-hand signal as ClickLock (index tip + thumb tip + wrist,
     per-point velocity EMA in normalized landmark units per frame), but
@@ -195,17 +197,27 @@ class StillLock:
 
     * UNLOCKED: all three points' EMA speed below ``stillness_threshold``
       for ``still_frames`` in a row (~30 @30fps = 1 s) -> "lock".
-    * LOCKED: frames whose EMA speed reaches ``motion_threshold`` add +1
-      to a motion meter; still frames drain it by ``unlock_decay``. Meter
-      reaching ``unlock_frames`` (~60 = 2 s of good movement) -> "unlock".
-      A lone jitter spike contributes at most +1 and drains away, so it
-      can never unlock alone.
+    * LOCKED, two independent release paths:
+      (a) DISPLACEMENT (primary): index tip drifts ``unlock_displacement``
+          (~0.06 = 6% of frame) away from the lock anchor, confirmed
+          ``unlock_confirm_frames`` running (spike out-and-back never
+          confirms). Works no matter how slowly the hand travelled — the
+          old motion-meter-only design stalled forever on deliberate
+          slow repositioning, leaving the cursor parked far from the
+          hand while pinch kept clicking the old spot.
+      (b) MOTION (waving): EMA speed >= ``motion_threshold`` adds +1 to a
+          meter; still frames drain it by ``unlock_decay`` (1, not 3 —
+          the old x3 drain made any pause cancel all wave progress, the
+          meter needed 75% moving frames sustained and simply never
+          fired for many users). Meter reaching ``unlock_frames``
+          (~60 = 2 s of good movement) -> "unlock".
     * After unlock, ``relock_cooldown_frames`` suppress re-locking so the
       tail of the releasing motion doesn't snap frozen again.
-    * Pinch exemption is caller-side: do not call ``update()`` while a
-      pinch is held/confirmed. Pinch shaping moves thumb+index a lot and
-      would otherwise feed the motion meter; skipping keeps pinch purely
-      a click action at the frozen cursor.
+    * Pinch exemption is caller-side: do not call ``update()`` while the
+      pinch channel is anywhere in its lifecycle (approach below the
+      pinch_off ratio, PINCHING, or FIRED). Pinch shaping/release moves
+      thumb+index a lot and would otherwise feed the unlock paths;
+      skipping keeps pinch purely a click action at the frozen cursor.
     """
 
     UNLOCKED = "unlocked"
@@ -219,7 +231,9 @@ class StillLock:
         still_frames: int = 30,
         motion_threshold: float = 0.008,
         unlock_frames: int = 60,
-        unlock_decay: int = 3,
+        unlock_decay: int = 1,
+        unlock_displacement: float = 0.06,
+        unlock_confirm_frames: int = 3,
         relock_cooldown_frames: int = 15,
         velocity_alpha: float = 0.35,
     ) -> None:
@@ -228,6 +242,8 @@ class StillLock:
         self.motion_threshold = max(0.0, motion_threshold)
         self.unlock_frames = max(1, unlock_frames)
         self.unlock_decay = max(1, unlock_decay)
+        self.unlock_displacement = max(0.0, unlock_displacement)
+        self.unlock_confirm_frames = max(1, unlock_confirm_frames)
         self.relock_cooldown_frames = max(0, relock_cooldown_frames)
         self.velocity_alpha = min(1.0, max(0.0, velocity_alpha))
 
@@ -237,6 +253,8 @@ class StillLock:
         self._prev = None
         self._vel = [0.0] * len(self._STILL_POINTS)
         self._cooldown_left = 0
+        self._anchor = None  # (x, y) index tip at lock time
+        self._disp_votes = 0
 
     @classmethod
     def _points(cls, landmarks):
@@ -273,25 +291,43 @@ class StillLock:
                     self.state = self.LOCKED
                     self._still_count = 0
                     self._move_meter = 0
+                    self._anchor = pts[0]  # index tip = cursor proxy
+                    self._disp_votes = 0
                     return "lock"
             else:
                 self._still_count = 0
             return None
 
-        # LOCKED — sustained motion only. Still frames drain the meter, so
-        # move-and-hold or lone spikes stall well short of unlock_frames.
+        # LOCKED — path (a): deliberate repositioning, speed-independent.
+        if self._anchor is not None:
+            ax, ay = pts[0]
+            d = math.hypot(ax - self._anchor[0], ay - self._anchor[1])
+            if d >= self.unlock_displacement:
+                self._disp_votes += 1
+                if self._disp_votes >= self.unlock_confirm_frames:
+                    return self._unlock()
+            else:
+                self._disp_votes = 0
+
+        # LOCKED — path (b): sustained waving. Still frames drain gently
+        # (x1) so a mid-wave pause costs one frame, not all progress.
         if max(self._vel) >= self.motion_threshold:
             self._move_meter += 1
             if self._move_meter >= self.unlock_frames:
-                self.state = self.UNLOCKED
-                self._move_meter = 0
-                self._still_count = 0
-                self._vel = [0.0] * len(self._STILL_POINTS)
-                self._cooldown_left = self.relock_cooldown_frames
-                return "unlock"
+                return self._unlock()
         else:
             self._move_meter = max(0, self._move_meter - self.unlock_decay)
         return None
+
+    def _unlock(self) -> str:
+        self.state = self.UNLOCKED
+        self._still_count = 0
+        self._move_meter = 0
+        self._vel = [0.0] * len(self._STILL_POINTS)
+        self._cooldown_left = self.relock_cooldown_frames
+        self._anchor = None
+        self._disp_votes = 0
+        return "unlock"
 
     def is_locked(self) -> bool:
         return self.state == self.LOCKED
@@ -308,3 +344,5 @@ class StillLock:
         self._prev = None
         self._vel = [0.0] * len(self._STILL_POINTS)
         self._cooldown_left = 0
+        self._anchor = None
+        self._disp_votes = 0

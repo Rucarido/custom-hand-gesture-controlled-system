@@ -138,14 +138,26 @@ game:
       require_index: true # cursor only moves while index is extended
       cooldown_ms: 250    # pinch-click repeat guard (uses click.cooldown_ms if absent)
       lock:
-        enabled: true         # still ~1 s -> cursor auto-locks in battle
+        enabled: true          # still ~1 s -> cursor auto-locks in battle
         still_frames: 30      # sustained whole-hand stillness to lock (~1 s)
         stillness_threshold: 0.003  # per-point EMA speed below this = still
-        unlock_frames: 60     # sustained motion to release (~2 s of movement)
+        unlock_displacement: 0.06   # PRIMARY unlock: hand drifts this far
+                                    # from the lock point (any speed) -> free
+        unlock_confirm_frames: 3   # ...confirmed N frames (spikes never confirm)
+        unlock_frames: 60     # WAVE unlock: sustained motion (~2 s of waving)
         motion_threshold: 0.008     # per-point EMA speed reaching this = moving
-        unlock_decay: 3       # still frames drain the unlock meter this fast
+        unlock_decay: 1       # still frames drain the wave meter gently
+                              # (x3 stall bug: any pause used to cancel all
+                              # wave progress, so slow moves NEVER unlocked)
         relock_cooldown_frames: 15  # no snap re-lock right after unlock
         velocity_alpha: 0.35  # per-point speed EMA (spike rejection)
+      classifier:              # trained model (README §8) drives the battle
+        enabled: true          # aim gate + lock feed: "pointing up?" is a
+        model: models/blazehand-mini/best.pt   # learned read, not geometry
+        conf_min: 0.50         # min softmax confidence to trust the pose;
+                              # below it the rule index gate decides instead
+        pointing_poses: ["index_only"]  # HaGRID->BlazeHand poses = "aiming"
+        every_n_frames: 1      # classify every Nth frame (1 = every frame)
   # Two-hand toggle: LEFT "1" + RIGHT "1" held together flips forced
   # OVERWORLD <-> BATTLE (same 1+1 flips back). Latch-until-release +
   # cooldown stop bounce; misses only decay the hold meter.

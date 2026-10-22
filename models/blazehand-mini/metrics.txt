@@ -1,0 +1,22 @@
+accuracy=0.9474  macro_f1=0.9480
+
+class                    n    prec     rec      f1  blazehand
+call                   150   1.000   1.000   1.000  none
+dislike                150   0.929   0.867   0.897  none
+fist                   150   0.938   1.000   0.968  fist
+four                   150   1.000   0.933   0.966  four
+like                   150   1.000   1.000   1.000  none
+mute                   150   1.000   1.000   1.000  none
+no_gesture             150   1.000   0.933   0.966  none
+ok                     150   0.875   0.933   0.903  none
+one                    150   0.812   0.867   0.839  index_only
+palm                   150   1.000   1.000   1.000  four
+peace                  150   0.800   0.800   0.800  peace
+peace_inverted         150   1.000   1.000   1.000  none
+rock                   150   0.789   1.000   0.882  none
+stop                   150   1.000   1.000   1.000  four
+stop_inverted          150   1.000   1.000   1.000  none
+three                  150   1.000   0.933   0.966  three
+three2                 150   1.000   0.933   0.966  three
+two_up                 150   0.929   0.867   0.897  peace
+two_up_inverted        150   1.000   0.933   0.966  none

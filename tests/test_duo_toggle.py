@@ -71,6 +71,16 @@ def test_cursor_none_when_no_index():
     assert pick_cursor_hand([]) == -1
 
 
+def test_cursor_allow_first_when_classifier_says_pointing():
+    hands = [_h("fist", "Left", index=False),
+             _h("peace", "Right", index=False)]
+    # rule gate sees nobody pointing: default stays put, classifier vouches
+    assert pick_cursor_hand(hands, prefer="Right") == -1
+    assert pick_cursor_hand(hands, prefer="Right", allow_first=True) == 1
+    assert pick_cursor_hand(hands, prefer="Left", allow_first=True) == 0
+    assert pick_cursor_hand([], allow_first=True) == -1
+
+
 # --- DuoToggle timing ------------------------------------------------------------
 
 

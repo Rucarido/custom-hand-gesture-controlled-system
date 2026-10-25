@@ -43,6 +43,18 @@ Recognition: 4-cue finger voting + FingerStateFilter + FingerCountDriver
 (overworld holds) / BattleTapGate (battle fire-once). Pinch freezes the
 walk driver so confirming never stutter-steps.
 
+PORTED MEDIPIPE GESTURES (hand-gesture-recognition-mediapipe, see
+src/mediapipe_gestures.py): every frame, each hand's landmarks are also
+classified by the KeyPointClassifier (Open/Close/Pointer/OK) and, while
+"a Pointer", the index-tip trail feeds the PointHistoryClassifier with a
+16-frame majority vote (Stop/Clockwise/Counter Clockwise/Move). The game
+uses: debounced Pointer sign -> extra aim gate (battle-cursor aim + lock
+feed), held OK sign -> battle select click (shared pinch cooldown, no
+double-clicks), configurable sign/motion -> key taps, and the sample's
+k/h/digit data capture ("g" cycles capture modes, 0-9 sets the label;
+rows append to data/gesture_capture/*.csv in the sample's exact row
+format). Everything degrades silently if the TFLite runtime is missing.
+
 Failsafes: hand lost -> all keys released; q/Esc/exception ->
 release_all() in finally.
 """
@@ -102,6 +114,7 @@ from gestures_game import (  # noqa: E402
     robust_finger_states,
 )
 from landmarks import choose_hand_index  # noqa: E402
+from mediapipe_gestures import GameGestures  # noqa: E402
 from overlay import draw_hand  # noqa: E402
 from pointer import PointerMapper  # noqa: E402
 from tracker import HandTracker  # noqa: E402
@@ -351,6 +364,23 @@ def run_game() -> None:
     clf_every = max(1, int(clf_cfg.get("every_n_frames", 1)))
     _clf_i = 0
 
+    # --- ported mediapipe sample recognizers (signs + motion, per hand) ---
+    # Every gesture-recognition piece from hand-gesture-recognition-mediapipe:
+    # KeyPointClassifier signs (Open/Close/Pointer/OK), PointHistoryClassifier
+    # motions (Stop/Clockwise/Counter Clockwise/Move, majority vote), the
+    # mirrored-input convention and the k/h CSV data capture.
+    mp_cfg = cfg.get("mediapipe_gestures", {}) or {}
+    mp_cfg.setdefault("mirror_x", mirror)
+    gestures = GameGestures(mp_cfg) if bool(mp_cfg.get("enabled", False)) else None
+    if gestures is not None:
+        print(f"[game] MP GESTURES: sign taps {gestures.sign_map or '(none)'} | "
+              f"motion taps {gestures.motion_map or '(none)'} | aim-gate "
+              f"{'ON' if gestures.aim_enabled else 'off'} | capture: g=mode 0-9=label"
+              + (f" -> {gestures.logger.directory}" if gestures.logger else " (no dir)"))
+    _collect_mode = 0  # 0=off 1=keypoint 2=point-history (like the sample app)
+    _COLLECT_NAMES = {0: "off", 1: "keypoint", 2: "history"}
+    _collect_number = 0
+
     def _reset_cursor_nav():
         nonlocal _frozen, lock_px, _last_sent, _lost_frames
         cursor_mapper.reset()
@@ -388,6 +418,8 @@ def run_game() -> None:
         _reset_cursor_nav()
         _cursor_id = None
         last_battle_move = None
+        if gestures:
+            gestures.reset()
         print(f"[game] context FORCED -> {target.upper()} ({why})")
 
     press, release = build_real_backend()
@@ -489,6 +521,8 @@ def run_game() -> None:
                     _reset_cursor_nav()
                     _cursor_id = None
                     last_battle_move = None
+                    if gestures:
+                        gestures.reset()
             elif force_mode is not None:
                 context = force_mode
             else:
@@ -527,6 +561,14 @@ def run_game() -> None:
                         "stable": _stable,
                         "bar": finger_bar(_stable),
                     })
+                # Ported mediapipe recognizers: per-handedness sign + motion
+                # classification (each hand keeps its own trail history).
+                if gestures:
+                    for _h in hands_info:
+                        _h["mp"] = gestures.update(_h["handedness"], _h["landmarks"])
+                    gestures.drop_missing(
+                        [h["handedness"] for h in hands_info]
+                    )
                 # Primary hand drives movement/taps (config preference,
                 # else the largest = most intentional hand).
                 _prim_idx = choose_hand_index(
@@ -543,6 +585,21 @@ def run_game() -> None:
                     f"{h['handedness']}:{h['bar']}({h['pose']})"
                     for h in hands_info
                 ))
+
+                prim_mp = _prim.get("mp") if gestures else None
+                _sign_aim_prim = (
+                    gestures.aim(_prim["handedness"], prim_mp)
+                    if gestures and gestures.models_ok else False
+                )
+                if gestures and gestures.models_ok:
+                    hud.append("MP: " + " ".join(
+                        f"{h['handedness'][:1]}:"
+                        f"{(h.get('mp') or {}).get('hand_sign', '-')}/"
+                        f"{(h.get('mp') or {}).get('gesture') or '-'}"
+                        for h in hands_info
+                    ))
+                elif gestures:
+                    hud.append("MP gestures: unavailable (tflite runtime?)")
 
                 # --- duo 1+1 toggle: flip forced OVERWORLD <-> BATTLE ---
                 _duo = is_duo_one_one(
@@ -590,7 +647,7 @@ def run_game() -> None:
                         )
                     _ci = pick_cursor_hand(
                         hands_info, prefer=cursor_prefer,
-                        allow_first=_ai_pointing is True,
+                        allow_first=(_ai_pointing is True) or _sign_aim_prim,
                     )
                     if _ci != -1:
                         _lost_frames = 0
@@ -600,12 +657,24 @@ def run_game() -> None:
                         if _cursor_id != _clabel:
                             _cursor_id = _clabel  # new aiming hand: reseed
                             _reset_cursor_nav()
+                        # The ported sign classifier joins the aim decision:
+                        # a debounced "Pointer" hand sign vouches for the
+                        # aiming read the same way the trained model does.
+                        if _clabel == _prim["handedness"]:
+                            _sign_aim_c = _sign_aim_prim  # gate already fed
+                        else:
+                            _sign_aim_c = (
+                                gestures.aim(_clabel, _ch.get("mp"))
+                                if gestures and gestures.models_ok else False
+                            )
+                        if _sign_aim_c:
+                            hud.append("Sign aim: ON (Pointer)")
                         # Confident "pointing" from the trained model
                         # replaces the rule-based index gate for the
                         # mapper — rule flicker used to freeze the cursor
                         # mid-aim (classic weak-recognition symptom).
                         cursor_mapper.require_index_extended = not (
-                            _ai_pointing is True
+                            (_ai_pointing is True) or _sign_aim_c
                         )
                         # Battle auto-lock gating. The pinch channel must
                         # be OPEN (approach/hold/release never feed the
@@ -626,10 +695,12 @@ def run_game() -> None:
                                 == PinchClickDetector.OPEN):
                             if _ai_pointing is True:
                                 _feed_lock = True
-                            elif _ai_pointing is None:
-                                _feed_lock = bool(_ch.get("index_extended"))
-                            else:
+                            elif _ai_pointing is False:
                                 _feed_lock = False
+                            elif _sign_aim_c:
+                                _feed_lock = True
+                            else:
+                                _feed_lock = bool(_ch.get("index_extended"))
                             if _feed_lock:
                                 lock_event = still_lock.update(_clm)
                             else:
@@ -714,6 +785,26 @@ def run_game() -> None:
                                     f"Cooldown: "
                                     f"{cursor_cooldown.remaining_ms:.0f}ms"
                                 )
+                        # Ported sign/motion taps on the aiming hand. The
+                        # OK-sign joins the pinch on the SAME cooldown, so
+                        # the two detectors can never double-click.
+                        if gestures and gestures.models_ok:
+                            _taps = gestures.taps(_ch.get("mp"), now)
+                            if _taps["sign"] == "click":
+                                if cursor_cooldown.ready():
+                                    if mouse is not None and keys.enabled:
+                                        mouse.click()
+                                    cursor_cooldown.fire()
+                                    hud.append("! CLICK (OK sign)")
+                            elif _taps["sign"] and keys.enabled:
+                                keys.tap(_taps["sign"])
+                                hud.append(f"! {_taps['sign'].upper()} (sign tap)")
+                            if _taps["motion"] and keys.enabled:
+                                keys.tap(_taps["motion"])
+                                hud.append(f"! {_taps['motion'].upper()} (motion tap)")
+                            gestures.collect(
+                                _collect_mode, _collect_number, _ch.get("mp")
+                            )
                     else:
                         _lost_frames += 1
                         # A pinch bends the index / the classifier may flip
@@ -826,12 +917,29 @@ def run_game() -> None:
                             hud.append(
                                 f"Cooldown: {cooldown.remaining_ms:.0f}ms")
 
+                # --- ported sign/motion taps + data capture (primary hand;
+                # battle-cursor handles these on its own aiming hand above) ---
+                if gestures and gestures.models_ok:
+                    _taps = gestures.taps(prim_mp, now)
+                    if _taps["sign"] and _taps["sign"] != "click" and keys.enabled:
+                        keys.tap(_taps["sign"])
+                        hud.append(f"! {_taps['sign'].upper()} (sign tap)")
+                    if _taps["motion"] and keys.enabled:
+                        keys.tap(_taps["motion"])
+                        hud.append(f"! {_taps['motion'].upper()} (motion tap)")
+                    gestures.collect(_collect_mode, _collect_number, prim_mp)
+
                 hud.append(f"Pose: {pose}")
                 extra = "" if mode == "fingers" else (
                     " +RUN" if _run_held else ""
                 )
                 hud.append(f"Dir: {direction}{extra}")
                 hud.append(f"Held: {','.join(sorted(keys.held)) or '-'}")
+                if _collect_mode:
+                    hud.append(
+                        f"MP recording: {_COLLECT_NAMES[_collect_mode]} "
+                        f"-> label {_collect_number}"
+                    )
             else:
                 hud.append("Hand: not detected")
                 hud.append("Dir: stop (released)")
@@ -854,6 +962,8 @@ def run_game() -> None:
                 keys.set_direction("stop")
                 last_palm = None
                 last_battle_move = None
+                if gestures:
+                    gestures.reset()  # stale trails must not survive a hand loss
 
             hud.append(f"CTX: {context.upper()}"
                        f"{' (FORCED)' if force_mode else ' (auto)'} (b/v)")
@@ -920,6 +1030,15 @@ def run_game() -> None:
                 joystick.cy = last_palm[1]
                 print(f"[game] joystick recentered to "
                       f"({joystick.cx:.3f}, {joystick.cy:.3f})")
+            elif key == ord("g"):
+                # Ported data capture from the sample app (its 'k'/'h'
+                # modes): cycle off -> keypoint -> point-history rows.
+                _collect_mode = (_collect_mode + 1) % 3
+                print(f"[game] MP capture {_COLLECT_NAMES[_collect_mode]} "
+                      f"(label {_collect_number})")
+            elif 48 <= key <= 57:
+                _collect_number = key - 48
+                print(f"[game] MP capture label -> {_collect_number}")
     finally:
         keys.release_all()
         camera.release()

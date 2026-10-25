@@ -71,6 +71,56 @@ display:
   mirror: true            # flip horizontally so movement feels natural
   show_landmarks: true
 
+# Landmark-based gesture recognition ported from the vendored
+# hand-gesture-recognition-mediapipe sample (see src/mediapipe_gestures.py):
+# KeyPointClassifier (Open/Close/Pointer/OK from 21 landmarks) +
+# PointHistoryClassifier (Stop/Clockwise/Counter Clockwise/Move from a
+# 16-frame index-tip trail). Display-only in pointer/full mode; fully wired
+# into game mode (see the `game:` subsection below).
+mediapipe_gestures:
+  enabled: true
+  models_dir: models/mediapipe_gestures
+  history_length: 16      # trail frames the motion classifier needs to vote
+  mirror_x: true          # landmark x handedness must match how the sample's
+                          # training data was captured (mirrored frames)
+  game:
+    # The debounced "Pointer" hand sign joins the trained-model aim decision
+    # in battle-cursor mode (and feeds cursor-lock the same way). Only a
+    # True verdict overrides anything; the rule index gate stays the
+    # fallback when the sign is not Pointer.
+    aim_gate:
+      enabled: true
+      enter_frames: 3       # consecutive Pointer signs to claim aiming
+      exit_frames: 4        # consecutive non-Pointer signs to drop it
+    # Hand-sign taps: label -> key. Special value "click" fires the
+    # battle-cursor select (shares the pinch cooldown, so they can never
+    # double-click). OK is effectively a pinch-alternative. Empty "" = off.
+    # Close/Open are left off by default: fist/palm already drive
+    # cancel/menu through the rule-based layer.
+    sign_taps:
+      OK: click
+      Close: ""
+      Open: ""
+    sign_tap:
+      stable_frames: 6      # a sign must hold N frames to fire its tap
+      cooldown_ms: 600
+    # Motion taps from the index-tip trail: only read while the hand signs
+    # "Pointer". Map the trail gestures to any key (e.g. Clockwise: e).
+    motion_taps:
+      Clockwise: ""         # e.g. "e" to bind
+      Counter Clockwise: ""
+      Move: ""
+      Stop: ""
+    motion_tap:
+      stable_frames: 2      # majority vote must hold this long (it already
+      cooldown_ms: 900      # stabilizes over the 16-frame vote window)
+    # Ported data capture (the sample app's k/h modes + digit labels).
+    # In game mode press 'g' to cycle off -> keypoint -> history rows,
+    # digits 0-9 to set the class label. Rows go to CSVs below, same
+    # headerless format as the sample's training data.
+    collection:
+      dir: data/gesture_capture
+
 game:
   # Movement keys sent while a direction is held. PBO accepts arrows or
   # WASD — "both" holds the pair together (arrow+wasd) so a lost-focus

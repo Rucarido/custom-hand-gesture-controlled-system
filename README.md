@@ -242,6 +242,10 @@ python -m venv .venv
 # 2) optional: trained-model runtime (battle aim/lock). The game works without it.
 .venv/Scripts/python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 
+# 2b) optional: TFLite runtime for the ported mediapipe gestures (HUD only).
+#     Falls back to TF's interpreter if installed; the app runs without either.
+.venv/Scripts/python -m pip install ai-edge-litert
+
 # 3) run
 .venv/Scripts/python src/main.py --mode game
 ```
@@ -255,8 +259,22 @@ The MediaPipe `hand_landmarker.task` model is downloaded automatically on first 
 |---|---|
 | `tracker` | Camera + landmarks only — use it to check tracking/lighting |
 | `pointer` | Index fingertip moves the OS cursor |
-| `full` | Pointer + pinch = mouse click (default) |
-| `game` | **The BlazeHand controller**: movement, battle taps, battle cursor, auto-lock, duo toggle |
+| `full` | Pointer + pinch = mouse click (default); HUD shows `Sign:`/`Motion:` |
+| `game` | **The BlazeHand controller**: movement, battle taps, battle cursor, auto-lock, duo toggle — plus the fully integrated mediapipe recognizer set |
+
+In `game` mode the ported hand-gesture-recognition-mediapipe stack is live:
+- **Signs** (Open/Close/Pointer/OK) classify per hand every frame (`MP:` HUD line);
+  a debounced **Pointer** sign joins the battle-cursor aim decision and the
+  cursor-lock feed, and a held **OK** sign clicks to select (shares the pinch
+  cooldown so they can never double-click). Mapping is in
+  `mediapipe_gestures.game.sign_taps`.
+- **Motions** (Stop/Clockwise/Counter Clockwise/Move) read the
+  index-tip trail while pointing; map them to keys via
+  `mediapipe_gestures.game.motion_taps` (off by default).
+- **Data capture** (the sample's k/h + 0-9 collection, ported): focus the
+  overlay and press `g` to cycle off → keypoint → point-history rows,
+  `0-9` to set the class label; rows append to `data/gesture_capture/*.csv`
+  in the exact format of the sample's training CSVs.
 
 Keys for `pointer`/`full`: `q`/`Esc` quit, `p` toggles mouse output.
 
@@ -288,6 +306,8 @@ All tunables live in `config/settings.yaml` (comments explain units/defaults). H
 | `game.battle.cursor.lock` | Auto-lock timing: `still_frames` 20 (~0.7 s), unlock displacement/meter |
 | `game.battle.cursor.classifier` | Trained model path, confidence threshold, aim poses |
 | `game.duo` | Two-hand toggle timing, handedness strictness, cursor hand preference |
+| `mediapipe_gestures` | Ported sample recognizers: models dir, trail length, `mirror_x` |
+| `mediapipe_gestures.game` | Game-mode wiring: `aim_gate` (Pointer-sign vouches aiming), `sign_taps` (OK→click), `motion_taps`, `collection` (press `g` + 0-9) |
 
 Every setting is optional; missing keys fall back to safe defaults in code.
 
@@ -300,6 +320,7 @@ config/settings.yaml     all tunables
 models/
   hand_landmarker.task   MediaPipe hand model (auto-downloaded)
   blazehand-mini/        trained classifier + metrics + labels
+  mediapipe_gestures/    vendored sample's TFLite classifiers + label CSVs
 src/
   main.py                entry point (mode selection, pointer/full loops)
   camera.py              webcam capture + warmup
@@ -315,13 +336,16 @@ src/
   game_keys.py           keyboard/mouse backend (pynput) + safe release
   game_overlay.py        game HUD, d-pad, battle menu, cursor, duo meter, help
   gesture_classifier.py  trained-model wrapper (lazy PyTorch import)
+  mediapipe_gestures.py  ported sample stack (MediaPipe hands app): keypoint +
+                         point-history TFLite classifiers, trail history, voting,
+                         game-mode channels (aim gate, sign/motion taps, capture)
   overlay.py / actions.py / model_utils.py / config_loader.py
 training/
   train_gesture.py       training loop (AMP, OneCycleLR, resume, ONNX export)
   make_subset.py         stratified subset builder
   check_classifier.py    sanity check: best.pt through the game wrapper
   extract_dataset.py / resize_dataset.py
-tests/                   hardware-free unit tests (71)
+tests/                   hardware-free unit tests (95)
 data/                    datasets (git-ignored, local only)
 ```
 
@@ -330,12 +354,13 @@ data/                    datasets (git-ignored, local only)
 ## 10. Testing and troubleshooting
 
 ```powershell
-.venv/Scripts/python -m pytest tests/ -q      # 71 passed
+.venv/Scripts/python -m pytest tests/ -q      # 95 passed
 ```
 
 The suite covers landmarks/geometry, filters, pinch detector, pointer gates, ClickLock,
 StillLock (lock/unlock/pause/cooldown), finger states, joystick, key controller, battle
-taps, context smoothing and the duo toggle — with synthetic hands, no hardware.
+taps, context smoothing, the duo toggle and the ported mediapipe gesture classifiers —
+with synthetic hands, no hardware.
 
 | Symptom | Fix |
 |---|---|

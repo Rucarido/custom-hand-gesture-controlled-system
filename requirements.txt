@@ -11,3 +11,8 @@ pyautogui
 # Optional — trained gesture model for battle-cursor aim/lock (README §2.5/§8):
 #   .venv/Scripts/python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 # The game runs fully rule-based without it (auto-detected).
+#
+# Optional — TFLite runtime for the ported mediapipe gesture recognizers
+# (src/mediapipe_gestures.py, HUD display in pointer/full modes).
+#   .venv/Scripts/python -m pip install ai-edge-litert
+# Falls back to an already-installed TensorFlow interpreter; not required.

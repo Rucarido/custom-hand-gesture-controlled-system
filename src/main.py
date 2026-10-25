@@ -36,6 +36,7 @@ from filters import (  # noqa: E402
     make_pointer_filter,
 )
 from gestures_click import PinchClickDetector  # noqa: E402
+from mediapipe_gestures import MediaPipeGestureRecognizer  # noqa: E402
 from overlay import draw_hand, draw_hud, draw_lock_indicator, draw_motion_area  # noqa: E402
 from pointer import PointerMapper  # noqa: E402
 from tracker import HandTracker  # noqa: E402
@@ -131,6 +132,18 @@ def run(mode: str) -> None:
     mouse = MouseActions()
     tick_fps = fps_counter()
 
+    # Ported MediaPipe sample recognizers (keypoint + point history).
+    mp_cfg = cfg.get("mediapipe_gestures", {})
+    if mp_cfg.get("enabled", False):
+        mp_cfg.setdefault("mirror_x", disp_cfg.get("mirror", False))
+        try:
+            recognizer = MediaPipeGestureRecognizer.from_config(mp_cfg)
+        except Exception as exc:  # missing/invalid tflite runtime stays non-fatal
+            print(f"[main] mediapipe gestures unavailable: {exc}")
+            recognizer = None
+    else:
+        recognizer = None
+
     window = "Gesture Control [q=quit p=toggle pointer]"
     clicks = 0
 
@@ -151,6 +164,13 @@ def run(mode: str) -> None:
             if hand:
                 draw_hand(frame, hand, disp_cfg)
                 hud.append(f"Hand: {hand['handedness']}")
+
+                if recognizer:
+                    res = recognizer.update(hand["landmarks"])
+                    if res:
+                        hud.append(f"Sign: {res['hand_sign']} | Motion: {res['gesture']}")
+                    else:
+                        hud.append("Sign: priming motion history")
 
                 if mode in ("pointer", "full"):
                     raw = pointer.landmarks_to_screen(hand["landmarks"])
@@ -216,6 +236,8 @@ def run(mode: str) -> None:
                                 hud.append(f"Cooldown: {cooldown.remaining_ms:.0f}ms")
             else:
                 hud.append("Hand: not detected")
+                if recognizer:
+                    recognizer.update(None)
                 smoother.reset()
                 predictor.reset()
                 pointer.reset()
